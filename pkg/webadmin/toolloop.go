@@ -1,0 +1,138 @@
+package webadmin
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+)
+
+type detectedToolCall struct {
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// isWebSearchTool reports whether a tool map is the web_search declaration.
+// Web search is a Copilot built-in (BingWebSearch) performed server-side, so
+// it must not enter the router decision; the answer stream handles it.
+func isWebSearchTool(t map[string]any) bool {
+	if s, _ := t["type"].(string); strings.EqualFold(s, "web_search") {
+		return true
+	}
+	if f, ok := t["function"].(map[string]any); ok {
+		if n, _ := f["name"].(string); strings.EqualFold(n, "web_search") {
+			return true
+		}
+	}
+	return false
+}
+
+// routeableTools drops web_search from the router decision set while keeping
+// every declared tool visible to the streaming JSON guard and prompt.
+func routeableTools(tools []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		if !isWebSearchTool(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func toolType(name string, tools []map[string]any) string {
+	for _, t := range tools {
+		f, _ := t["function"].(map[string]any)
+		if n, _ := f["name"].(string); n == name {
+			if typ, _ := t["type"].(string); typ != "" {
+				return typ
+			}
+		}
+	}
+	return "function"
+}
+
+func allowedToolNames(tools []map[string]any) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range tools {
+		if f, ok := t["function"].(map[string]any); ok {
+			if n, ok := f["name"].(string); ok && n != "" {
+				out[n] = true
+			}
+		}
+	}
+	return out
+}
+
+func toolChoiceAllows(choice any, name string) bool {
+	if choice == nil {
+		return true
+	}
+	if s, ok := choice.(string); ok {
+		return s != "none" && (s != "required" || name != "")
+	}
+	if m, ok := choice.(map[string]any); ok {
+		if f, ok := m["function"].(map[string]any); ok {
+			n, _ := f["name"].(string)
+			return n == name
+		}
+		if n, ok := m["name"].(string); ok {
+			return n == name
+		}
+	}
+	return true
+}
+
+// callID returns a globally unique tool call id. Content hashes previously
+// collided when the same tool+arguments was invoked again (duplicate tool call
+// id errors from clients), so uniqueness must not depend on call content.
+func callID(name, args string, index int) string {
+	return "call_" + uuid.NewString()
+}
+
+func extractToolCalls(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
+	start := strings.Index(text, "<m365-tool-call>")
+	end := strings.Index(text, "</m365-tool-call>")
+	if start < 0 || end <= start {
+		return nil, false
+	}
+	var raw any
+	if json.Unmarshal([]byte(text[start+len("<m365-tool-call>"):end]), &raw) != nil {
+		return nil, false
+	}
+	items := []any{raw}
+	if arr, ok := raw.([]any); ok {
+		items = arr
+	}
+	allowed := allowedToolNames(tools)
+	out := make([]detectedToolCall, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		n, _ := m["name"].(string)
+		if !allowed[n] || !toolChoiceAllows(choice, n) {
+			continue
+		}
+		a, _ := json.Marshal(m["arguments"])
+		out = append(out, detectedToolCall{ID: callID(n, string(a), i), Type: toolType(n, tools), Name: n, Arguments: a})
+	}
+	return out, len(out) > 0
+}
+
+func validateToolResult(messages []oaiMsg, known map[string]bool) error {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			if m.ToolCallID == "" {
+				return fmt.Errorf("tool_call_id required")
+			}
+			if len(known) > 0 && !known[m.ToolCallID] {
+				return fmt.Errorf("unknown tool_call_id: %s", m.ToolCallID)
+			}
+		}
+	}
+	return nil
+}
