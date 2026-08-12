@@ -10,5 +10,5 @@ require (
 
 require (
 	github.com/dlclark/regexp2 v1.10.0 // indirect
-	golang.org/x/net v0.35.0
+	golang.org/x/net v0.57.0
 )
