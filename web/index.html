@@ -544,6 +544,24 @@ if (response.output_text) {
           </div>
           <table class="table"><thead><tr><th>Account</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table>
         </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">Rotation settings</span><span style="font-size:11px;color:var(--muted)">Rotate accounts after a request limit and refresh tokens on a schedule</span></div>
+          <div class="card-body">
+            <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+              <div>
+                <label class="form-label">Max requests per account</label>
+                <input class="form-input" id="maxReqPerAccount" type="number" min="0" step="1" style="width:180px" placeholder="e.g. 50 (0 = rotate every request)">
+                <p class="form-hint" style="margin-top:4px">Switch to the next account after this many requests</p>
+              </div>
+              <div>
+                <label class="form-label">Token refresh interval (minutes)</label>
+                <input class="form-input" id="tokenRefreshInterval" type="number" min="0" step="1" style="width:180px" placeholder="e.g. 60 (0 = on expiry)">
+                <p class="form-hint" style="margin-top:4px">Redeem a fresh access token every N minutes</p>
+              </div>
+              <button class="btn primary" onclick="saveRotationSettings()" style="margin-bottom:4px">Save rotation settings</button>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- API Keys -->
@@ -859,6 +877,16 @@ const localeText={
   'Error':'错误',
   'No matching accounts':'暂无匹配账号',
   'Delete':'删除',
+  'Rotation settings':'轮换设置',
+  'Rotate accounts after a request limit and refresh tokens on a schedule':'达到请求上限后轮换账号，并按计划定时刷新令牌',
+  'Max requests per account':'每账号最大请求数',
+  'Switch to the next account after this many requests':'达到该请求数后切换到下一个账号',
+  'Token refresh interval (minutes)':'令牌刷新间隔（分钟）',
+  'Redeem a fresh access token every N minutes':'每 N 分钟换取新的访问令牌',
+  'Save rotation settings':'保存轮换设置',
+  'Rotation settings saved':'轮换设置已保存',
+  'Max requests per account must be a non-negative number':'每账号最大请求数必须是非负数字',
+  'Token refresh interval must be a non-negative number':'令牌刷新间隔必须是非负数字',
   'No API keys':'暂无 API Key',
   'Active':'有效',
   'Disabled':'已禁用',
@@ -1066,10 +1094,25 @@ function renderAccounts(){
 }
 async function loadAccounts(){
   try{
-    const d=await api('/api/accounts');
+    const [d,s]=await Promise.all([api('/api/accounts'),api('/api/admin/settings')]);
     _accountsCache=d.accounts||[];
     renderAccounts();
+    if(s&&s.settings){
+      $('maxReqPerAccount').value=s.settings.maxRequestsPerAccount??'';
+      $('tokenRefreshInterval').value=s.settings.tokenRefreshIntervalMins??'';
+    }
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
+}
+
+async function saveRotationSettings(){
+  const maxReq=parseInt($('maxReqPerAccount').value,10);
+  const interval=parseInt($('tokenRefreshInterval').value,10);
+  if(!(maxReq>=0))return showNotice('Max requests per account must be a non-negative number','error');
+  if(!(interval>=0))return showNotice('Token refresh interval must be a non-negative number','error');
+  try{
+    await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({maxRequestsPerAccount:maxReq,tokenRefreshIntervalMins:interval})});
+    showNotice('Rotation settings saved','success');
+  }catch(e){showNotice(e.message,'error');}
 }
 
 async function deleteAccount(id){

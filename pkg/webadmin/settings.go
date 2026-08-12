@@ -60,8 +60,10 @@ type runtimeSettings struct {
 	Authority           string         `json:"authority"`
 	RedirectURI         string         `json:"redirectUri"`
 	Scope               string         `json:"scope"`
-	ModelMappings       []modelMapping `json:"modelMappings"`
-	ToolPlanningMode    string         `json:"toolPlanningMode"`
+	ModelMappings             []modelMapping `json:"modelMappings"`
+	ToolPlanningMode          string         `json:"toolPlanningMode"`
+	MaxRequestsPerAccount     int            `json:"maxRequestsPerAccount"`
+	TokenRefreshIntervalMins  int            `json:"tokenRefreshIntervalMins"`
 }
 
 type settingsStore struct {
@@ -85,8 +87,10 @@ func defaultRuntimeSettings() runtimeSettings {
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
 		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
 		Authority: os.Getenv("M365_AUTHORITY"), RedirectURI: os.Getenv("M365_REDIRECT_URI"), Scope: os.Getenv("M365_SCOPE"),
-		ModelMappings:    append([]modelMapping(nil), defaultModelMappings...),
-		ToolPlanningMode: toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
+		ModelMappings:             append([]modelMapping(nil), defaultModelMappings...),
+		ToolPlanningMode:          toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
+		MaxRequestsPerAccount:     envInt("M365_MAX_REQUESTS_PER_ACCOUNT", 50),
+		TokenRefreshIntervalMins:  envInt("M365_TOKEN_REFRESH_INTERVAL_MINS", 60),
 	}
 }
 func settingsPath() string {
@@ -137,6 +141,12 @@ func validateSettings(v runtimeSettings) error {
 	}
 	if v.ImageTimeoutSeconds < 5 || v.ImageTimeoutSeconds > 3600 {
 		return fmt.Errorf("图片超时必须为 5-3600 秒")
+	}
+	if v.MaxRequestsPerAccount < 0 || v.MaxRequestsPerAccount > 100000 {
+		return fmt.Errorf("每个账号最大请求数必须为 0-100000")
+	}
+	if v.TokenRefreshIntervalMins < 1 || v.TokenRefreshIntervalMins > 10080 {
+		return fmt.Errorf("令牌刷新间隔必须为 1-10080 分钟")
 	}
 	if v.LogLevel != "silent" && v.LogLevel != "error" && v.LogLevel != "warn" && v.LogLevel != "info" && v.LogLevel != "debug" {
 		return fmt.Errorf("日志等级必须为 silent、error、warn、info 或 debug")
@@ -221,6 +231,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
+		s.applyTokenRefreshInterval()
 		if e := outbound.ConfigurePool(v.ProxyPool); e != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return

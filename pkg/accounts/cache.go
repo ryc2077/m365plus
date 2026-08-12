@@ -28,13 +28,23 @@ type Cache struct {
 }
 
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	data     Cache
-	nextIdx  int
-	inflight map[string]*inflightRefresh
-	cdp      *CDPRefresher
-	cdpMu    sync.Mutex
+	mu              sync.Mutex
+	path            string
+	data            Cache
+	nextIdx         int
+	inflight        map[string]*inflightRefresh
+	cdp             *CDPRefresher
+	cdpMu           sync.Mutex
+	refreshInterval time.Duration
+}
+
+// SetRefreshInterval forces EnsureValid to redeem a fresh access token every
+// interval, even before the current token expires. Zero disables the periodic
+// refresh and keeps the default expiry-based behaviour.
+func (s *Store) SetRefreshInterval(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshInterval = d
 }
 
 // SetCDPRefresher attaches the CDP fallback used when the plain-HTTP refresh
@@ -232,6 +242,12 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 	acc, ok := s.Get(id)
 	if !ok {
 		return AccountToken{}, os.ErrNotExist
+	}
+	s.mu.Lock()
+	interval := s.refreshInterval
+	s.mu.Unlock()
+	if interval > 0 && time.Since(acc.UpdatedAt) >= interval {
+		return s.refreshInflight(acc)
 	}
 	if time.Now().Before(acc.ExpiresAt.Add(-30 * time.Second)) {
 		return acc, nil

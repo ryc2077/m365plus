@@ -51,6 +51,9 @@ type Server struct {
 	chatFunc            ChatFunc
 	dataPlane           http.Handler
 	debug               *debugStore
+	rotationMu          sync.Mutex
+	rotationID          string
+	rotationCount       int
 }
 
 // New builds the administrative server bound to the shared account store.
@@ -74,7 +77,7 @@ func New() (*Server, error) {
 			sessionTTL = d
 		}
 	}
-	return &Server{
+	s := &Server{
 		tokens:              store,
 		accountPool:         newAccountHealth(),
 		pkce:                map[string]pendingPKCE{},
@@ -90,7 +93,16 @@ func New() (*Server, error) {
 		settings:            openSettingsStore(),
 		usage:               openUsageLog(),
 		debug:               openDebugStore(),
-	}, nil
+	}
+	s.applyTokenRefreshInterval()
+	return s, nil
+}
+
+// applyTokenRefreshInterval pushes the configured refresh interval into the
+// account store so EnsureValid re-mints tokens on that cadence.
+func (s *Server) applyTokenRefreshInterval() {
+	cfg := s.settings.get()
+	s.tokens.SetRefreshInterval(time.Duration(cfg.TokenRefreshIntervalMins) * time.Minute)
 }
 
 // ResolveAccountForKey implements the servers.AccountResolver contract: maps a
