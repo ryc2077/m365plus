@@ -237,7 +237,7 @@ func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN in
 	now := time.Now().UnixMilli()
 	deleted := 0
 	kept := 0
-	for round := 0; round < 100; round++ {
+	for range 100 {
 		chats, err := c.ListConversations()
 		if err != nil {
 			return deleted, err

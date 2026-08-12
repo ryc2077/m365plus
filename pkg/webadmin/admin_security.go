@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -72,8 +73,8 @@ func clientIP(r *http.Request) string {
 		// A trusted reverse proxy appends the client address to XFF. Use the
 		// right-most valid address rather than the attacker-controlled first one.
 		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
+		for _, part := range slices.Backward(parts) {
+			if ip := net.ParseIP(strings.TrimSpace(part)); ip != nil {
 				return ip.String()
 			}
 		}

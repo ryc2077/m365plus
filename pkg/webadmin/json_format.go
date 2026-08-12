@@ -8,8 +8,8 @@ func normalizeJSONText(s string) string {
 		if i := strings.IndexByte(s, '\n'); i >= 0 {
 			s = s[i+1:]
 		}
-		if strings.HasSuffix(s, "```") {
-			s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
+		if before, ok := strings.CutSuffix(s, "```"); ok {
+			s = strings.TrimSpace(before)
 		}
 	}
 	return s

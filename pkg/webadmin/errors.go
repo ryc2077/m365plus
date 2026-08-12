@@ -10,8 +10,7 @@ import (
 )
 
 func logOAuthError(stage string, err error) {
-	var oauthErr *accounts.OAuthError
-	if errors.As(err, &oauthErr) {
+	if oauthErr, ok := errors.AsType[*accounts.OAuthError](err); ok {
 		log.Printf("oauth_error stage=%s error=%q aadsts=%q http_status=%d correlation_id=%q trace_id=%q", stage, oauthErr.Code, oauthErr.AADSTS, oauthErr.HTTPStatus, oauthErr.CorrelationID, oauthErr.TraceID)
 		return
 	}

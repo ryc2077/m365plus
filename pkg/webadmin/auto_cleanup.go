@@ -65,7 +65,7 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 		createMs int64
 	}
 	deleted := 0
-	for round := 0; round < 100; round++ {
+	for range 100 {
 		chats, err := m365CloudClient.ListConversations()
 		if err != nil {
 			log.Printf("[auto-cleanup] list failed: %v", err)

@@ -242,14 +242,8 @@ func (s *usageLog) logs(limit, offset int) map[string]any {
 	if offset > total {
 		offset = total
 	}
-	start := total - offset - limit
-	if start < 0 {
-		start = 0
-	}
-	end := total - offset
-	if end < 0 {
-		end = 0
-	}
+	start := max(total-offset-limit, 0)
+	end := max(total-offset, 0)
 	if start >= end {
 		return map[string]any{"logs": []UsageRecord{}, "total": total}
 	}

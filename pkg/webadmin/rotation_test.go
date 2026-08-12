@@ -15,7 +15,7 @@ func seedStoreN(t *testing.T, dir string, n int) *accounts.Store {
 	path := filepath.Join(dir, "accounts.json")
 	os.MkdirAll(dir, 0o700)
 	var list []accounts.AccountToken
-	for i := 0; i < n; i++ {
+	for i := range n {
 		id := "oid-" + string(rune('a'+i))
 		list = append(list, accounts.AccountToken{
 			ID:           id,
@@ -52,7 +52,7 @@ func TestNextRotationAccountCycles(t *testing.T) {
 	}
 
 	seen := []string{}
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		acc, err := s.nextRotationAccount()
 		if err != nil {
 			t.Fatalf("iter %d: %v", i, err)
@@ -113,7 +113,7 @@ func TestNextRotationAccountNoLimit(t *testing.T) {
 	}
 
 	seen := []string{}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		acc, err := s.nextRotationAccount()
 		if err != nil {
 			t.Fatal(err)

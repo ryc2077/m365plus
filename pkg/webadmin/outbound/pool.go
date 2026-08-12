@@ -72,10 +72,7 @@ func (p *Pool) mark(raw string, err error) {
 				e.cooldown = time.Time{}
 			} else {
 				e.failures++
-				d := time.Duration(e.failures) * 2 * time.Second
-				if d > 2*time.Minute {
-					d = 2 * time.Minute
-				}
+				d := min(time.Duration(e.failures)*2*time.Second, 2*time.Minute)
 				e.cooldown = time.Now().Add(d)
 			}
 			return

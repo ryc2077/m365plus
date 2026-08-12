@@ -186,10 +186,7 @@ func contextFingerprint(messages []oaiMsg) string {
 		return ""
 	}
 	var parts []string
-	limit := len(messages)
-	if limit > 3 {
-		limit = 3
-	}
+	limit := min(len(messages), 3)
 	for i := len(messages) - limit; i < len(messages); i++ {
 		m := messages[i]
 		parts = append(parts, m.Role+":"+contentToString(m.Content))
@@ -239,8 +236,8 @@ func jaccardSimilarity(a, b string) float64 {
 
 func tokenize(s string) map[string]bool {
 	tokens := map[string]bool{}
-	words := strings.Fields(strings.ToLower(s))
-	for _, w := range words {
+	words := strings.FieldsSeq(strings.ToLower(s))
+	for w := range words {
 		tokens[w] = true
 	}
 	return tokens
@@ -258,17 +255,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitID]; ok {
 			if sess, ok := sr.sessions[sessID]; ok {
-			sess.LastUsedAt = time.Now().UTC()
-			sr.sessions[sessID] = sess
-			sr.persist.markDirty()
-			return ResolveResult{
-				SessionID:      sess.SessionID,
-				ConversationID: sess.ConversationID,
-				AccountID:      sess.AccountID,
-				MatchedBy:      "explicit",
-				IsNew:          false,
-				HistoryLen:     len(sess.ContextHistory),
-			}
+				sess.LastUsedAt = time.Now().UTC()
+				sr.sessions[sessID] = sess
+				sr.persist.markDirty()
+				return ResolveResult{
+					SessionID:      sess.SessionID,
+					ConversationID: sess.ConversationID,
+					AccountID:      sess.AccountID,
+					MatchedBy:      "explicit",
+					IsNew:          false,
+					HistoryLen:     len(sess.ContextHistory),
+				}
 			}
 		}
 		if sess, ok := sr.sessions[explicitID]; ok {

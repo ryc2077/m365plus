@@ -27,7 +27,7 @@ type deployment struct {
 	ActiveURL     string    `json:"activeUrl,omitempty"`
 	Status        string    `json:"status"`
 	LatencyMs     int64     `json:"latencyMs,omitempty"`
-	LastCheckedAt time.Time `json:"lastCheckedAt,omitempty"`
+	LastCheckedAt time.Time `json:"lastCheckedAt"`
 	LastError     string    `json:"lastError,omitempty"`
 }
 type deploymentStore struct {

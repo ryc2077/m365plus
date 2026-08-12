@@ -5,6 +5,7 @@ package webadmin
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -66,12 +67,7 @@ var gatewayModels = []modelSpec{
 }
 
 func validUpstreamTone(tone string) bool {
-	for _, known := range knownUpstreamTones() {
-		if tone == known {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(knownUpstreamTones(), tone)
 }
 
 func knownUpstreamTones() []string {
@@ -130,10 +126,7 @@ func configuredModelLimits() modelLimits {
 	contextWindow := cfg.ContextWindow
 	maxOutput := cfg.MaxOutputTokens
 	if maxOutput >= contextWindow {
-		maxOutput = contextWindow / 8
-		if maxOutput < 1 {
-			maxOutput = 1
-		}
+		maxOutput = max(contextWindow/8, 1)
 	}
 	return modelLimits{ContextWindow: contextWindow, MaxInputTokens: contextWindow - maxOutput, MaxOutputTokens: maxOutput}
 }

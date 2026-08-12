@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,28 +43,28 @@ var configurableCodexModels = []string{
 }
 
 type runtimeSettings struct {
-	MaxToolCallsPerTurn int            `json:"maxToolCallsPerTurn"`
-	MaxToolRounds       int            `json:"maxToolRounds"`
-	ContextWindow       int            `json:"contextWindow"`
-	MaxOutputTokens     int            `json:"maxOutputTokens"`
-	ChatTimeoutSeconds  int            `json:"chatTimeoutSeconds"`
-	ImageTimeoutSeconds int            `json:"imageTimeoutSeconds"`
-	LogLevel            string         `json:"logLevel"`
-	DebugLogPath        string         `json:"debugLogPath"`
-	ListenAddress       string         `json:"listenAddress"`
-	ConfigPath          string         `json:"configPath"`
-	TokenCachePath      string         `json:"tokenCachePath"`
-	SessionCachePath    string         `json:"sessionCachePath"`
-	OutboundProxy       string         `json:"outboundProxy"`
-	ProxyPool           []string       `json:"proxyPool,omitempty"`
-	ClientID            string         `json:"clientId"`
-	Authority           string         `json:"authority"`
-	RedirectURI         string         `json:"redirectUri"`
-	Scope               string         `json:"scope"`
-	ModelMappings             []modelMapping `json:"modelMappings"`
-	ToolPlanningMode          string         `json:"toolPlanningMode"`
-	MaxRequestsPerAccount     int            `json:"maxRequestsPerAccount"`
-	TokenRefreshIntervalMins  int            `json:"tokenRefreshIntervalMins"`
+	MaxToolCallsPerTurn      int            `json:"maxToolCallsPerTurn"`
+	MaxToolRounds            int            `json:"maxToolRounds"`
+	ContextWindow            int            `json:"contextWindow"`
+	MaxOutputTokens          int            `json:"maxOutputTokens"`
+	ChatTimeoutSeconds       int            `json:"chatTimeoutSeconds"`
+	ImageTimeoutSeconds      int            `json:"imageTimeoutSeconds"`
+	LogLevel                 string         `json:"logLevel"`
+	DebugLogPath             string         `json:"debugLogPath"`
+	ListenAddress            string         `json:"listenAddress"`
+	ConfigPath               string         `json:"configPath"`
+	TokenCachePath           string         `json:"tokenCachePath"`
+	SessionCachePath         string         `json:"sessionCachePath"`
+	OutboundProxy            string         `json:"outboundProxy"`
+	ProxyPool                []string       `json:"proxyPool,omitempty"`
+	ClientID                 string         `json:"clientId"`
+	Authority                string         `json:"authority"`
+	RedirectURI              string         `json:"redirectUri"`
+	Scope                    string         `json:"scope"`
+	ModelMappings            []modelMapping `json:"modelMappings"`
+	ToolPlanningMode         string         `json:"toolPlanningMode"`
+	MaxRequestsPerAccount    int            `json:"maxRequestsPerAccount"`
+	TokenRefreshIntervalMins int            `json:"tokenRefreshIntervalMins"`
 }
 
 type settingsStore struct {
@@ -87,10 +88,10 @@ func defaultRuntimeSettings() runtimeSettings {
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
 		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
 		Authority: os.Getenv("M365_AUTHORITY"), RedirectURI: os.Getenv("M365_REDIRECT_URI"), Scope: os.Getenv("M365_SCOPE"),
-		ModelMappings:             append([]modelMapping(nil), defaultModelMappings...),
-		ToolPlanningMode:          toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
-		MaxRequestsPerAccount:     envInt("M365_MAX_REQUESTS_PER_ACCOUNT", 50),
-		TokenRefreshIntervalMins:  envInt("M365_TOKEN_REFRESH_INTERVAL_MINS", 60),
+		ModelMappings:            append([]modelMapping(nil), defaultModelMappings...),
+		ToolPlanningMode:         toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
+		MaxRequestsPerAccount:    envInt("M365_MAX_REQUESTS_PER_ACCOUNT", 50),
+		TokenRefreshIntervalMins: envInt("M365_TOKEN_REFRESH_INTERVAL_MINS", 60),
 	}
 }
 func settingsPath() string {
@@ -114,6 +115,7 @@ var openSettingsStore = sync.OnceValue(func() *settingsStore {
 	}
 	return s
 })
+
 func firstNonEmptySetting(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -218,9 +220,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
 			return
 		}
-		for k, v := range patch {
-			merged[k] = v
-		}
+		maps.Copy(merged, patch)
 		mergedJSON, _ := json.Marshal(merged)
 		var v runtimeSettings
 		if json.Unmarshal(mergedJSON, &v) != nil {

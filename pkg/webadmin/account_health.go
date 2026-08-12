@@ -28,8 +28,7 @@ func IsRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
-	var httpErr *UpstreamHTTPError
-	if errors.As(err, &httpErr) {
+	if httpErr, ok := errors.AsType[*UpstreamHTTPError](err); ok {
 		return httpErr.Status == 429 || httpErr.Status == 503
 	}
 	msg := strings.ToLower(err.Error())
@@ -45,8 +44,7 @@ func IsAuthFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	var httpErr *UpstreamHTTPError
-	if errors.As(err, &httpErr) {
+	if httpErr, ok := errors.AsType[*UpstreamHTTPError](err); ok {
 		return httpErr.Status == 401 || httpErr.Status == 403
 	}
 	return false
@@ -56,8 +54,7 @@ func IsAuthFailure(err error) bool {
 // error, or 0 when absent. The web layer surfaces this to clients so they can
 // back off instead of hammering a throttled pool.
 func RetryAfterSeconds(err error) int {
-	var httpErr *UpstreamHTTPError
-	if errors.As(err, &httpErr) {
+	if httpErr, ok := errors.AsType[*UpstreamHTTPError](err); ok {
 		return httpErr.RetryAfter
 	}
 	return 0

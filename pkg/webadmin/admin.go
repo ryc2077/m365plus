@@ -177,8 +177,8 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		Status      string    `json:"status"`
 		OID         string    `json:"oid,omitempty"`
 		TID         string    `json:"tid,omitempty"`
-		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
-		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+		ExpiresAt   time.Time `json:"expiresAt"`
+		UpdatedAt   time.Time `json:"updatedAt"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -404,7 +404,7 @@ func (s *Server) nextRotationAccount() (accounts.AccountToken, error) {
 				return s.tokens.EnsureValid(acc.ID)
 			}
 		}
-		for i := 0; i < maxAccountProbe; i++ {
+		for range maxAccountProbe {
 			acc, ok := s.tokens.Next()
 			if !ok {
 				return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
@@ -438,7 +438,7 @@ func (s *Server) nextRotationAccount() (accounts.AccountToken, error) {
 // nextHealthyAccount returns the next round-robin account that is still
 // healthy, skipping the given id first, and validates its token.
 func (s *Server) nextHealthyAccount(avoidID string) (accounts.AccountToken, error) {
-	for i := 0; i < maxAccountProbe; i++ {
+	for range maxAccountProbe {
 		acc, ok := s.tokens.Next()
 		if !ok {
 			return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
