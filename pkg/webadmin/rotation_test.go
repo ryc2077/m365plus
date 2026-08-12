@@ -47,6 +47,7 @@ func TestNextRotationAccountCycles(t *testing.T) {
 	s.settings = openSettingsStore()
 	cfg := s.settings.get()
 	cfg.MaxRequestsPerAccount = 2
+	cfg.AutoRotateAccounts = true
 	if err := s.settings.save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +77,7 @@ func TestNextRotationAccountSkipsUnavailable(t *testing.T) {
 	s.settings = openSettingsStore()
 	cfg := s.settings.get()
 	cfg.MaxRequestsPerAccount = 2
+	cfg.AutoRotateAccounts = true
 	if err := s.settings.save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +110,7 @@ func TestNextRotationAccountNoLimit(t *testing.T) {
 	s.settings = openSettingsStore()
 	cfg := s.settings.get()
 	cfg.MaxRequestsPerAccount = 0
+	cfg.AutoRotateAccounts = true
 	if err := s.settings.save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -125,5 +128,124 @@ func TestNextRotationAccountNoLimit(t *testing.T) {
 		if seen[i] != want[i] {
 			t.Fatalf("iter %d: got %s want %s (full %v)", i, seen[i], want[i], seen)
 		}
+	}
+}
+
+// TestNextRotationAccountPinned verifies that with auto-rotation disabled the
+// account stays pinned so incremental sessions can continue on the same M365
+// account; the pin only moves when the account becomes unavailable.
+func TestNextRotationAccountPinned(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{tokens: seedStoreN(t, dir, 2), accountPool: newAccountHealth()}
+	s.settings = openSettingsStore()
+	cfg := s.settings.get()
+	cfg.AutoRotateAccounts = false
+	if err := s.settings.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 4 {
+		acc, err := s.nextRotationAccount()
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if acc.ID != "oid-a" {
+			t.Fatalf("iter %d: expected pinned oid-a, got %s", i, acc.ID)
+		}
+	}
+
+	s.accountPool.MarkFailure("oid-a", &UpstreamHTTPError{Status: 429}, time.Minute)
+	acc, err := s.nextRotationAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "oid-b" {
+		t.Fatalf("expected oid-b after pinned account failed, got %s", acc.ID)
+	}
+	acc, err = s.nextRotationAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "oid-b" {
+		t.Fatalf("expected oid-b to stay pinned, got %s", acc.ID)
+	}
+}
+
+// TestSwitchAccount verifies the manual switch pins a specific account and
+// resets the rotation request counter.
+func TestSwitchAccount(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{tokens: seedStoreN(t, dir, 2), accountPool: newAccountHealth()}
+	s.settings = openSettingsStore()
+	cfg := s.settings.get()
+	cfg.MaxRequestsPerAccount = 2
+	cfg.AutoRotateAccounts = true
+	if err := s.settings.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.nextRotationAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "oid-a" {
+		t.Fatalf("expected oid-a first, got %s", acc.ID)
+	}
+
+	if err := s.switchToAccount("oid-b"); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		acc, err = s.nextRotationAccount()
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if acc.ID != "oid-b" {
+			t.Fatalf("iter %d: expected switched oid-b, got %s", i, acc.ID)
+		}
+	}
+}
+
+// TestSettingsMutualExclusion verifies saving settings with auto-rotation
+// enabled forces incremental context off.
+func TestSettingsMutualExclusion(t *testing.T) {
+	s := openSettingsStore()
+	cfg := s.get()
+	cfg.AutoRotateAccounts = true
+	cfg.IncrementalContext = true
+	if err := s.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	got := s.get()
+	if !got.AutoRotateAccounts {
+		t.Fatal("expected autoRotateAccounts to stay true")
+	}
+	if got.IncrementalContext {
+		t.Fatal("expected incrementalContext to be forced off when auto-rotation is on")
+	}
+}
+
+// TestIncrementalContextEnabled verifies the resolver reports rotation and
+// incremental context as mutually exclusive.
+func TestIncrementalContextEnabled(t *testing.T) {
+	s := &Server{settings: openSettingsStore()}
+
+	cfg := s.settings.get()
+	cfg.AutoRotateAccounts = false
+	cfg.IncrementalContext = true
+	if err := s.settings.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IncrementalContextEnabled() {
+		t.Fatal("expected incremental context enabled with rotation off")
+	}
+
+	cfg = s.settings.get()
+	cfg.AutoRotateAccounts = true
+	if err := s.settings.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if s.IncrementalContextEnabled() {
+		t.Fatal("expected incremental context disabled when rotation is on")
 	}
 }

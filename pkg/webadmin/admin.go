@@ -170,6 +170,9 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list := s.tokens.List()
+	s.rotationMu.Lock()
+	activeID := s.rotationID
+	s.rotationMu.Unlock()
 	type view struct {
 		ID          string    `json:"id"`
 		Email       string    `json:"email"`
@@ -179,6 +182,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		TID         string    `json:"tid,omitempty"`
 		ExpiresAt   time.Time `json:"expiresAt"`
 		UpdatedAt   time.Time `json:"updatedAt"`
+		Active      bool      `json:"active"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -186,9 +190,60 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
+			Active: a.ID == activeID,
 		})
 	}
 	jsonOut(w, map[string]any{"accounts": out})
+}
+
+// switchToAccount pins the active rotation account to the requested id and
+// resets the rotation request counter so the manually selected account serves
+// the next requests until rotation (if enabled) counts up to the limit again.
+func (s *Server) switchToAccount(id string) error {
+	if id == "" {
+		return fmt.Errorf("account id is empty")
+	}
+	acc, ok := s.tokens.Get(id)
+	if !ok {
+		return fmt.Errorf("account not found")
+	}
+	if !s.accountPool.Available(acc.ID) {
+		return fmt.Errorf("account is cooling down or failing auth")
+	}
+	s.rotationMu.Lock()
+	s.rotationID = acc.ID
+	s.rotationCount = 0
+	s.rotationMu.Unlock()
+	return nil
+}
+
+// switchAccount handles POST /api/accounts/switch.
+func (s *Server) switchAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.ID) == "" {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	acc, ok := s.tokens.Get(strings.TrimSpace(body.ID))
+	if !ok {
+		http.Error(w, "account not found", http.StatusNotFound)
+		return
+	}
+	if !s.accountPool.Available(acc.ID) {
+		http.Error(w, "account is cooling down or failing auth", http.StatusConflict)
+		return
+	}
+	if err := s.switchToAccount(acc.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	jsonOut(w, map[string]any{"status": "switched", "active": acc.ID})
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -377,9 +432,12 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveAccount selects a healthy account for a request. When the key is not
-// bound to a specific account it rotates over the pool: the current account
-// serves up to MaxRequestsPerAccount requests before the next healthy account
-// takes over (cycling). Cooling-down or auth-failing accounts are skipped.
+// bound to a specific account, the selection honours the rotation policy:
+// with automatic rotation enabled the current account serves up to
+// MaxRequestsPerAccount requests before the next healthy account takes over
+// (cycling); with rotation disabled a stable account is pinned so incremental
+// sessions can continue across turns. Cooling-down or auth-failing accounts
+// are always skipped.
 func (s *Server) resolveAccount(accountID string) (accounts.AccountToken, error) {
 	if accountID == "" {
 		return s.nextRotationAccount()
@@ -387,52 +445,79 @@ func (s *Server) resolveAccount(accountID string) (accounts.AccountToken, error)
 	return s.tokens.EnsureValid(accountID)
 }
 
-// nextRotationAccount applies the request-count rotation policy. With
+// nextRotationAccount applies the account-rotation policy. With
 // MaxRequestsPerAccount <= 0 it keeps the legacy per-request round-robin.
 func (s *Server) nextRotationAccount() (accounts.AccountToken, error) {
-	var maxReq int
+	var cfg runtimeSettings
 	if s.settings != nil {
-		maxReq = s.settings.get().MaxRequestsPerAccount
+		cfg = s.settings.get()
 	}
+	autoRotate := cfg.AutoRotateAccounts
+	maxReq := cfg.MaxRequestsPerAccount
+
 	s.rotationMu.Lock()
 	defer s.rotationMu.Unlock()
 
-	if maxReq > 0 {
-		if s.rotationID != "" && s.rotationCount < maxReq {
-			if acc, ok := s.tokens.Get(s.rotationID); ok && s.accountPool.Available(acc.ID) {
-				s.rotationCount++
+	if autoRotate {
+		if maxReq > 0 {
+			if s.rotationID != "" && s.rotationCount < maxReq {
+				if acc, ok := s.tokens.Get(s.rotationID); ok && s.accountPool.Available(acc.ID) {
+					s.rotationCount++
+					return s.tokens.EnsureValid(acc.ID)
+				}
+			}
+			for range maxAccountProbe {
+				acc, ok := s.tokens.Next()
+				if !ok {
+					return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
+				}
+				if !s.accountPool.Available(acc.ID) {
+					continue
+				}
+				s.rotationID = acc.ID
+				s.rotationCount = 1
 				return s.tokens.EnsureValid(acc.ID)
 			}
+			return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
 		}
-		for range maxAccountProbe {
-			acc, ok := s.tokens.Next()
+		acc, ok := s.tokens.Next()
+		if !ok {
+			return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
+		}
+		for i := 0; !s.accountPool.Available(acc.ID) && i < maxAccountProbe; i++ {
+			acc, ok = s.tokens.Next()
 			if !ok {
-				return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
+				break
 			}
-			if !s.accountPool.Available(acc.ID) {
-				continue
-			}
-			s.rotationID = acc.ID
-			s.rotationCount = 1
-			return s.tokens.EnsureValid(acc.ID)
 		}
-		return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
+		if !s.accountPool.Available(acc.ID) {
+			return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
+		}
+		return s.tokens.EnsureValid(acc.ID)
 	}
 
-	acc, ok := s.tokens.Next()
-	if !ok {
-		return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
-	}
-	for i := 0; !s.accountPool.Available(acc.ID) && i < maxAccountProbe; i++ {
-		acc, ok = s.tokens.Next()
-		if !ok {
-			break
+	// Rotation disabled: pin a stable healthy account so incremental sessions
+	// stay on the same M365 account across turns. Switch only when the pinned
+	// account becomes unavailable.
+	if s.rotationID != "" {
+		if acc, ok := s.tokens.Get(s.rotationID); ok && s.accountPool.Available(acc.ID) {
+			return s.tokens.EnsureValid(acc.ID)
 		}
+		s.rotationID = ""
 	}
-	if !s.accountPool.Available(acc.ID) {
-		return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
+	for range maxAccountProbe {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			return accounts.AccountToken{}, fmt.Errorf("no accounts; login first")
+		}
+		if !s.accountPool.Available(acc.ID) {
+			continue
+		}
+		s.rotationID = acc.ID
+		s.rotationCount = 1
+		return s.tokens.EnsureValid(acc.ID)
 	}
-	return s.tokens.EnsureValid(acc.ID)
+	return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
 }
 
 // nextHealthyAccount returns the next round-robin account that is still

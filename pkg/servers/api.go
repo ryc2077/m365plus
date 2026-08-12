@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ryc2077/m365plus/pkg/auth"
@@ -58,17 +59,31 @@ type ContextCache struct {
 	order      []string
 	writeFile  func(string, []byte, os.FileMode) error
 	removeFile func(string) error
+	enabled    atomic.Bool
+}
+
+// SetEnabled toggles session persistence. When disabled the cache behaves as
+// if every key were empty: reads return zero state and writes are ignored, so
+// each request starts a fresh M365 conversation with no continued context.
+func (cc *ContextCache) SetEnabled(on bool) {
+	cc.enabled.Store(on)
+}
+
+func (cc *ContextCache) isEnabled() bool {
+	return cc.enabled.Load()
 }
 
 // NewContextCache creates a new context cache instance.
 func NewContextCache(cacheDir string) *ContextCache {
 	os.MkdirAll(cacheDir, 0700)
-	return &ContextCache{
+	cc := &ContextCache{
 		cacheDir:   cacheDir,
 		mem:        make(map[string]SessionState),
 		writeFile:  os.WriteFile,
 		removeFile: os.Remove,
 	}
+	cc.enabled.Store(true)
+	return cc
 }
 
 // path returns the file path for a cache key.
@@ -85,6 +100,9 @@ func (cc *ContextCache) Get(key string) string {
 
 // GetSession retrieves the persisted session state by session key.
 func (cc *ContextCache) GetSession(key string) SessionState {
+	if !cc.isEnabled() {
+		return SessionState{}
+	}
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if st, ok := cc.mem[key]; ok {
@@ -111,6 +129,9 @@ func (cc *ContextCache) GetSession(key string) SessionState {
 // session id and turn count so an incremental session continues correctly
 // across turns.
 func (cc *ContextCache) Set(key, convID string) {
+	if !cc.isEnabled() {
+		return
+	}
 	prev := cc.GetSession(key)
 	if prev.ConversationID == convID {
 		return
@@ -121,6 +142,9 @@ func (cc *ContextCache) Set(key, convID string) {
 
 // SetSession persists the session state by session key.
 func (cc *ContextCache) SetSession(key string, st SessionState) {
+	if !cc.isEnabled() {
+		return
+	}
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if st.ConversationID == "" {
@@ -347,6 +371,12 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			logging.Warnf("Auth: account resolution failed for %s: %v", r.RemoteAddr, err)
 			api.sendError(w, http.StatusUnauthorized, "Invalid API key")
 			return
+		}
+		// The incremental-context toggle follows the resolver's policy so the
+		// management plane can disable session continuation while account
+		// rotation is active (rotation would otherwise hop conversations).
+		if resolver := api.accountResolverLocked(); resolver != nil {
+			api.ctxCache.SetEnabled(resolver.IncrementalContextEnabled())
 		}
 		if ra != nil {
 			r = withReqAccount(r, ra)

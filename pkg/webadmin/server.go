@@ -127,6 +127,20 @@ func (s *Server) ResolveAccountForKey(rawKey string) (accounts.AccountToken, boo
 	return acc, true, nil
 }
 
+// IncrementalContextEnabled reports whether session-context continuation is
+// allowed. Rotation and incremental context are mutually exclusive: the data
+// plane turns the context cache off while account rotation is active.
+func (s *Server) IncrementalContextEnabled() bool {
+	if s.settings == nil {
+		return true
+	}
+	cfg := s.settings.get()
+	if cfg.AutoRotateAccounts {
+		return false
+	}
+	return cfg.IncrementalContext
+}
+
 // Accounts exposes the shared account pool to the data plane.
 func (s *Server) Accounts() *accounts.Store { return s.tokens }
 
@@ -221,6 +235,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
+	m.HandleFunc("/api/accounts/switch", s.switchAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)

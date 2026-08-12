@@ -1428,6 +1428,38 @@ func TestContextCacheSessionStatePersistence(t *testing.T) {
 	}
 }
 
+// TestContextCacheDisabled verifies the incremental-context gate: when disabled
+// the cache ignores reads and writes so every turn starts a fresh conversation,
+// and re-enabling restores normal behavior.
+func TestContextCacheDisabled(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewContextCache(cacheDir)
+	cache.SetEnabled(false)
+
+	// Writes are ignored while disabled.
+	cache.Set("session:conv-a", "conv-backend-1")
+	if got := cache.Get("session:conv-a"); got != "" {
+		t.Fatalf("disabled cache returned %q, want empty", got)
+	}
+	cache.SetSession("session:conv-a", SessionState{ConversationID: "conv-backend-1", ClientSessionID: "cs-1", TurnCount: 1})
+	if st := cache.GetSession("session:conv-a"); st.ConversationID != "" || st.TurnCount != 0 {
+		t.Fatalf("disabled cache returned session %+v, want zero state", st)
+	}
+
+	// Every turn looks like a fresh session while disabled.
+	turn := cacheTurnHelper(t, cache, "session:conv-a")
+	if !turn.IsStartOfSession {
+		t.Fatal("disabled cache turn must be isStartOfSession=true")
+	}
+
+	// Re-enabling restores normal continuation.
+	cache.SetEnabled(true)
+	cache.Set("session:conv-a", "conv-backend-2")
+	if got := cache.Get("session:conv-a"); got != "conv-backend-2" {
+		t.Fatalf("enabled cache returned %q, want conv-backend-2", got)
+	}
+}
+
 func TestContextCacheSetPreservesSession(t *testing.T) {
 	cacheDir := t.TempDir()
 	cache := NewContextCache(cacheDir)

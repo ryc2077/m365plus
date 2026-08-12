@@ -23,6 +23,11 @@ type AccountResolver interface {
 	// (zero) AccountToken with ok=false; the data plane then selects the next
 	// healthy account itself.
 	ResolveAccountForKey(apiKey string) (accounts.AccountToken, bool, error)
+
+	// IncrementalContextEnabled reports whether the incremental-session
+	// context (persisted conversation continuation) is currently allowed.
+	// When the resolver is nil (single-account mode) it defaults to enabled.
+	IncrementalContextEnabled() bool
 }
 
 // reqAccount carries the per-request account binding through the call chain.

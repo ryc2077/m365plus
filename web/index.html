@@ -230,6 +230,16 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
 .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-size:12px;font-weight:600;padding:5px 12px;border-radius:7px;cursor:pointer;transition:all .15s var(--ease-out)}
 .seg button:hover{color:var(--text)}
 .seg button.active{background:var(--primary);color:var(--bg)}
+.switch{position:relative;display:inline-block;width:34px;height:20px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.switch .slider{position:absolute;inset:0;background:var(--line);border-radius:10px;cursor:pointer;transition:background .15s var(--ease-out)}
+.switch .slider::before{content:'';position:absolute;width:14px;height:14px;left:3px;top:3px;background:var(--bg);border-radius:50%;transition:transform .15s var(--ease-out)}
+.switch input:checked+.slider{background:var(--primary)}
+.switch input:checked+.slider::before{transform:translateX(14px)}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.toggle-row:last-child{border-bottom:0}
+.toggle-row .toggle-label{font-size:13px;font-weight:600}
+.toggle-row .toggle-hint{font-size:11px;color:var(--muted);margin-top:2px}
 .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
 @media(max-width:900px){.chart-grid{grid-template-columns:1fr}}
 .chart{background:var(--surface);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:16px 18px;animation:slideUp .4s var(--ease-out) both}
@@ -543,6 +553,7 @@ if (response.output_text) {
             </div>
           </div>
           <table class="table"><thead><tr><th>Account</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table>
+          <div class="pagination" style="padding:10px 18px"><span style="font-size:11px;color:var(--muted)">"Switch" makes this account the active one for the next request.</span></div>
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">Rotation settings</span><span style="font-size:11px;color:var(--muted)">Rotate accounts after a request limit and refresh tokens on a schedule</span></div>
@@ -559,6 +570,16 @@ if (response.output_text) {
                 <p class="form-hint" style="margin-top:4px">Redeem a fresh access token every N minutes</p>
               </div>
               <button class="btn primary" onclick="saveRotationSettings()" style="margin-bottom:4px">Save rotation settings</button>
+            </div>
+            <div style="margin-top:14px">
+              <div class="toggle-row">
+                <div><div class="toggle-label">Auto rotate accounts</div><div class="toggle-hint">Rotate to the next healthy account after the request limit</div></div>
+                <label class="switch"><input type="checkbox" id="autoRotateAccounts" onchange="onRotateToggle()"><span class="slider"></span></label>
+              </div>
+              <div class="toggle-row">
+                <div><div class="toggle-label">Incremental context</div><div class="toggle-hint">Continue the same M365 conversation across turns (disable if sessions start fresh)</div></div>
+                <label class="switch"><input type="checkbox" id="incrementalContext" onchange="onIncrementalToggle()"><span class="slider"></span></label>
+              </div>
             </div>
           </div>
         </div>
@@ -887,6 +908,14 @@ const localeText={
   'Rotation settings saved':'轮换设置已保存',
   'Max requests per account must be a non-negative number':'每账号最大请求数必须是非负数字',
   'Token refresh interval must be a non-negative number':'令牌刷新间隔必须是非负数字',
+  'Auto rotate accounts':'自动轮换账号',
+  'Rotate to the next healthy account after the request limit':'达到请求上限后自动切换到下一个健康账号',
+  'Incremental context':'增量上下文',
+  'Continue the same M365 conversation across turns (disable if sessions start fresh)':'跨轮次延续同一个 M365 会话（若每次会话都重新开始请关闭）',
+  'Switch':'切换',
+  'Current':'当前',
+  'Switched to account':'已切换账号',
+  '"Switch" makes this account the active one for the next request.':'点击“切换”将使该账号成为下一次请求的活动账号。',
   'No API keys':'暂无 API Key',
   'Active':'有效',
   'Disabled':'已禁用',
@@ -1090,7 +1119,7 @@ function renderAccounts(){
     if(q&&!((x.displayName||'')+' '+(x.email||'')).toLowerCase().includes(q))return false;
     return true;
   });
-  $('accountRows').innerHTML=list.length?list.map(x=>`<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td><span class="status ${x.status==='online'?'online':'offline'}"><i></i>${x.status==='online'?'Online':'Offline'}</span></td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No matching accounts</td></tr>';
+  $('accountRows').innerHTML=list.length?list.map(x=>`<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}${x.active?' <span class="status online" style="font-size:10px"><i></i>Current</span>':''}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td><span class="status ${x.status==='online'?'online':'offline'}"><i></i>${x.status==='online'?'Online':'Offline'}</span></td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><div style="display:flex;gap:6px;align-items:center"><button class="btn-sm btn" onclick="switchAccount('${x.id}')" ${x.active?'disabled':''}>${x.active?'Current':'Switch'}</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></div></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
   try{
@@ -1100,6 +1129,8 @@ async function loadAccounts(){
     if(s&&s.settings){
       $('maxReqPerAccount').value=s.settings.maxRequestsPerAccount??'';
       $('tokenRefreshInterval').value=s.settings.tokenRefreshIntervalMins??'';
+      $('autoRotateAccounts').checked=!!s.settings.autoRotateAccounts;
+      $('incrementalContext').checked=!!s.settings.incrementalContext;
     }
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
 }
@@ -1110,9 +1141,27 @@ async function saveRotationSettings(){
   if(!(maxReq>=0))return showNotice('Max requests per account must be a non-negative number','error');
   if(!(interval>=0))return showNotice('Token refresh interval must be a non-negative number','error');
   try{
-    await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({maxRequestsPerAccount:maxReq,tokenRefreshIntervalMins:interval})});
+    await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({maxRequestsPerAccount:maxReq,tokenRefreshIntervalMins:interval,autoRotateAccounts:$('autoRotateAccounts').checked,incrementalContext:$('incrementalContext').checked})});
     showNotice('Rotation settings saved','success');
+    loadAccounts();
   }catch(e){showNotice(e.message,'error');}
+}
+
+function onRotateToggle(){
+  if($('autoRotateAccounts').checked){
+    $('incrementalContext').checked=false;
+  }
+}
+
+function onIncrementalToggle(){
+  if($('incrementalContext').checked){
+    $('autoRotateAccounts').checked=false;
+  }
+}
+
+async function switchAccount(id){
+  try{await api('/api/accounts/switch',{method:'POST',body:JSON.stringify({id})});showNotice('Switched to account','success');loadAccounts();}
+  catch(e){showNotice(e.message,'error');}
 }
 
 async function deleteAccount(id){

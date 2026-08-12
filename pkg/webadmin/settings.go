@@ -65,6 +65,8 @@ type runtimeSettings struct {
 	ToolPlanningMode         string         `json:"toolPlanningMode"`
 	MaxRequestsPerAccount    int            `json:"maxRequestsPerAccount"`
 	TokenRefreshIntervalMins int            `json:"tokenRefreshIntervalMins"`
+	AutoRotateAccounts       bool           `json:"autoRotateAccounts"`
+	IncrementalContext       bool           `json:"incrementalContext"`
 }
 
 type settingsStore struct {
@@ -80,6 +82,15 @@ func envInt(name string, fallback int) int {
 	}
 	return fallback
 }
+func envBool(name string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return fallback
+}
 func defaultRuntimeSettings() runtimeSettings {
 	return runtimeSettings{
 		MaxToolCallsPerTurn: envInt("M365_MAX_TOOL_CALLS_PER_TURN", 32), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 512),
@@ -92,6 +103,8 @@ func defaultRuntimeSettings() runtimeSettings {
 		ToolPlanningMode:         toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
 		MaxRequestsPerAccount:    envInt("M365_MAX_REQUESTS_PER_ACCOUNT", 50),
 		TokenRefreshIntervalMins: envInt("M365_TOKEN_REFRESH_INTERVAL_MINS", 60),
+		AutoRotateAccounts:       envBool("M365_AUTO_ROTATE_ACCOUNTS", false),
+		IncrementalContext:       envBool("M365_INCREMENTAL_CONTEXT", true),
 	}
 }
 func settingsPath() string {
@@ -186,6 +199,12 @@ func validateSettings(v runtimeSettings) error {
 }
 func (s *settingsStore) get() runtimeSettings { s.mu.RLock(); defer s.mu.RUnlock(); return s.v }
 func (s *settingsStore) save(v runtimeSettings) error {
+	// Mutual exclusion: account rotation hops conversations between accounts,
+	// so incremental-session context must always be forced off when automatic
+	// rotation is enabled. This is the authoritative backend enforcement.
+	if v.AutoRotateAccounts {
+		v.IncrementalContext = false
+	}
 	if e := validateSettings(v); e != nil {
 		return e
 	}
@@ -221,6 +240,12 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		maps.Copy(merged, patch)
+		// Mutual exclusion: account rotation hops conversations between
+		// accounts, so incremental-session context must be forced off when
+		// automatic rotation is enabled.
+		if v, ok := merged["autoRotateAccounts"].(bool); ok && v {
+			merged["incrementalContext"] = false
+		}
 		mergedJSON, _ := json.Marshal(merged)
 		var v runtimeSettings
 		if json.Unmarshal(mergedJSON, &v) != nil {
