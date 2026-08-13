@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.9] - 2026-08-13
+
+### Added
+- Per-account SSO cookies: each account has its own encrypted cookie store (`sso_cookies_<accountId>.json` / `m365_cookies_<accountId>.json`), managed from a per-account "SSO" button on the Accounts page
+- Web admin SSO input now uses name/value/domain fields instead of hand-written JSON; status shown inline per account
+- `auth.ReauthWithSSOCookies` reusable silent re-auth core; `auth.SaveSSOCookieBatchFor`/`SSOStatusFor`/`LoadSSOCookiesFor` per-account variants
+- Account pool SSO re-auth fallback: `Store.SetSSOReauth` hook is tried before the CDP path when the refresh-token chain dies, rotating to fresh tokens from the account's own SSO cookies
+- `GET/POST /api/sso` accept an optional `accountId`; `/api/accounts` reports per-account SSO cookie state
+
 ## [1.3.8] - 2026-08-13
 
 ### Added
