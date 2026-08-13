@@ -36,7 +36,15 @@ type Store struct {
 	cdp             *CDPRefresher
 	cdpMu           sync.Mutex
 	refreshInterval time.Duration
+	ssoReauth       SSOReauthFunc
 }
+
+// SSOReauthFunc performs silent SSO cookie re-authentication for an account
+// when the plain-HTTP refresh exchange fails (dead RT chain). It returns a
+// fresh TokenSet, mirroring the legacy TokenManager SSO fallback but scoped to
+// a single account's cookie store. Injected by the admin plane, which wires it
+// to the auth package; nil disables the fallback.
+type SSOReauthFunc func(acc AccountToken) (TokenSet, error)
 
 // SetRefreshInterval forces EnsureValid to redeem a fresh access token every
 // interval, even before the current token expires. Zero disables the periodic
@@ -53,6 +61,15 @@ func (s *Store) SetCDPRefresher(c *CDPRefresher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cdp = c
+}
+
+// SetSSOReauth attaches the per-account SSO cookie re-authentication hook.
+// It is tried before the CDP fallback because it needs no Chromium. A nil value
+// disables the hook.
+func (s *Store) SetSSOReauth(fn SSOReauthFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ssoReauth = fn
 }
 
 // inflightRefresh coalesces concurrent EnsureValid refreshes for the same
@@ -286,11 +303,25 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 	s.mu.Unlock()
 
 	tok, err := Refresh(acc.RefreshToken)
+	if err != nil {
+		// Dead refresh_token chain (AADSTS invalid_grant etc): try the
+		// per-account SSO cookie re-authentication hook first (no Chromium
+		// needed), then fall back to the CDP capture path.
+		s.mu.Lock()
+		ssoReauth := s.ssoReauth
+		s.mu.Unlock()
+		if ssoReauth != nil {
+			if ssoTok, serr := ssoReauth(acc); serr == nil {
+				err = nil
+				tok = ssoTok
+				acc.Status = "online"
+			}
+		}
+	}
 	if err != nil && s.cdp != nil && s.cdp.Enabled() {
-		// Dead refresh_token chain (AADSTS invalid_grant etc): fall back to the
-		// CDP capture path, which reuses the account's signed-in Chromium
-		// profile to silently SSO and mint a fresh substrate token. Serialised
-		// globally: only one Chromium may be alive at a time.
+		// Reuses the account's signed-in Chromium profile to silently SSO and
+		// mint a fresh substrate token. Serialised globally: only one Chromium
+		// may be alive at a time.
 		s.cdpMu.Lock()
 		refreshed, cerr := s.cdp.Refresh(acc)
 		s.cdpMu.Unlock()

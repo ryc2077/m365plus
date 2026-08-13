@@ -70,6 +70,7 @@ func New() (*Server, error) {
 	} else {
 		logging.Warnf("CDP refresh fallback unavailable: %v", cerr)
 	}
+	store.SetSSOReauth(ssoReauthForAccount)
 	password, mustChange := loadAdminPassword()
 	sessionTTL := 30 * time.Minute
 	if v := os.Getenv("M365_USER_SESSION_TTL_MINUTES"); v != "" {

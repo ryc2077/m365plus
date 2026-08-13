@@ -38,6 +38,36 @@ const (
 // ErrM365CookiesUnavailable indicates that no cookies for the M365 web app are stored.
 var ErrM365CookiesUnavailable = errors.New("M365 web app cookies unavailable")
 
+// ssoCookiesFileFor returns the per-account SSO cookie store path. An empty
+// accountID maps to the legacy global store so single-account setups keep
+// working unchanged.
+func ssoCookiesFileFor(accountID string) string {
+	if accountID == "" {
+		return ssoCookiesFile
+	}
+	return filepath.Join(filepath.Dir(ssoCookiesFile), "sso_cookies_"+sanitizeAccountID(accountID)+".json")
+}
+
+// m365CookiesFileFor returns the per-account M365 web cookie store path.
+func m365CookiesFileFor(accountID string) string {
+	if accountID == "" {
+		return m365CookiesFile
+	}
+	return filepath.Join(filepath.Dir(m365CookiesFile), "m365_cookies_"+sanitizeAccountID(accountID)+".json")
+}
+
+// sanitizeAccountID turns an account id (oid or email) into a safe file-name
+// fragment, mirroring the CDP profile directory sanitisation.
+func sanitizeAccountID(id string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, id)
+}
+
 // SSOCookie represents a browser cookie used by M365 authentication or web APIs.
 type SSOCookie struct {
 	Name     string `json:"name"`
@@ -94,14 +124,29 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 		return fmt.Errorf("failed to encrypt SSO cookies: %w", err)
 	}
 
-	dir := filepath.Dir(ssoCookiesFile)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
-		}
+	return atomicWriteFile(ssoCookiesFile, []byte(encrypted), 0600)
+}
+
+// SaveSSOCookiesFor stores SSO cookies for a specific account, isolated from
+// other accounts by a per-account file. An empty accountID writes the legacy
+// global store.
+func SaveSSOCookiesFor(accountID string, cookies []SSOCookie) error {
+	store := SSOCookieStore{
+		Cookies:    cookies,
+		CapturedAt: time.Now(),
 	}
 
-	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
+	data, err := json.Marshal(store)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SSO cookies: %w", err)
+	}
+
+	encrypted, err := crypto.Encrypt(string(data))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt SSO cookies: %w", err)
+	}
+
+	return atomicWriteFile(ssoCookiesFileFor(accountID), []byte(encrypted), 0600)
 }
 
 // SaveM365Cookies encrypts and stores browser cookies used by M365 web APIs.
@@ -114,7 +159,21 @@ func SaveM365Cookies(cookies []SSOCookie) error {
 	return saveM365CookieStore(store)
 }
 
+// SaveM365CookiesFor stores M365 web cookies for a specific account.
+func SaveM365CookiesFor(accountID string, cookies []SSOCookie) error {
+	store := m365CookieStore{
+		Domain:      "m365.cloud.microsoft",
+		ExtractedAt: time.Now(),
+		Cookies:     cookies,
+	}
+	return saveM365CookieStoreFor(accountID, store)
+}
+
 func saveM365CookieStore(store m365CookieStore) error {
+	return saveM365CookieStoreFor("", store)
+}
+
+func saveM365CookieStoreFor(accountID string, store m365CookieStore) error {
 	data, err := json.Marshal(store)
 	if err != nil {
 		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
@@ -123,7 +182,7 @@ func saveM365CookieStore(store m365CookieStore) error {
 	if err != nil {
 		return fmt.Errorf("failed to encrypt M365 cookies: %w", err)
 	}
-	if err := atomicWriteFile(m365CookiesFile, []byte(encrypted), 0600); err != nil {
+	if err := atomicWriteFile(m365CookiesFileFor(accountID), []byte(encrypted), 0600); err != nil {
 		return fmt.Errorf("failed to save M365 cookies: %w", err)
 	}
 	return nil
@@ -179,13 +238,19 @@ type SSOCookieStatus struct {
 // SSOStatus reports whether SSO and M365 web cookies are stored and how many
 // cookies each store holds, without exposing their values.
 func SSOStatus() SSOCookieStatus {
+	return SSOStatusFor("")
+}
+
+// SSOStatusFor reports the SSO cookie state for a specific account, without
+// exposing cookie values.
+func SSOStatusFor(accountID string) SSOCookieStatus {
 	status := SSOCookieStatus{}
-	if store, err := loadSSOCookieStore(); err == nil {
+	if store, err := loadSSOCookieStoreFor(accountID); err == nil {
 		status.LoginAvailable = true
 		status.LoginCookies = len(store.Cookies)
 		status.LoginCaptured = store.CapturedAt
 	}
-	if store, err := loadM365CookieStore(); err == nil {
+	if store, err := loadM365CookieStoreFor(accountID); err == nil {
 		status.M365Available = true
 		status.M365Cookies = len(store.Cookies)
 		status.M365Captured = store.ExtractedAt
@@ -197,6 +262,13 @@ func SSOStatus() SSOCookieStatus {
 // SSO store and M365 web-app cookies in the M365 store. It returns the count
 // of cookies saved to each store.
 func SaveSSOCookieBatch(cookies []SSOCookie) (loginCount, m365Count int, err error) {
+	return SaveSSOCookieBatchFor("", cookies)
+}
+
+// SaveSSOCookieBatchFor splits cookies by domain and stores them for the given
+// account, isolated from other accounts. An empty accountID writes the legacy
+// global stores.
+func SaveSSOCookieBatchFor(accountID string, cookies []SSOCookie) (loginCount, m365Count int, err error) {
 	var loginCookies, m365Cookies []SSOCookie
 	for _, c := range cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(c.Domain)), ".")
@@ -208,12 +280,12 @@ func SaveSSOCookieBatch(cookies []SSOCookie) (loginCount, m365Count int, err err
 		}
 	}
 	if len(loginCookies) > 0 {
-		if err := SaveSSOCookies(loginCookies); err != nil {
+		if err := SaveSSOCookiesFor(accountID, loginCookies); err != nil {
 			return 0, 0, err
 		}
 	}
 	if len(m365Cookies) > 0 {
-		if err := SaveM365Cookies(m365Cookies); err != nil {
+		if err := SaveM365CookiesFor(accountID, m365Cookies); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -222,7 +294,14 @@ func SaveSSOCookieBatch(cookies []SSOCookie) (loginCount, m365Count int, err err
 
 // loadSSOCookieStore reads and decrypts the SSO cookie store from disk.
 func loadSSOCookieStore() (*SSOCookieStore, error) {
-	data, err := os.ReadFile(ssoCookiesFile)
+	return loadSSOCookieStoreFor("")
+}
+
+// loadSSOCookieStoreFor reads and decrypts the SSO cookie store for a specific
+// account. An empty accountID reads the legacy global store.
+func loadSSOCookieStoreFor(accountID string) (*SSOCookieStore, error) {
+	path := ssoCookiesFileFor(accountID)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("SSO cookies file not found: %w", err)
 	}
@@ -245,14 +324,29 @@ func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
 	return loadSSOCookieStore()
 }
 
+// LoadSSOCookiesFor returns the decrypted SSO cookie store for a specific
+// account. Used by the account-pool SSO reauth hook.
+func LoadSSOCookiesFor(accountID string) (*SSOCookieStore, error) {
+	return loadSSOCookieStoreFor(accountID)
+}
+
 // hasSSOCookies checks if SSO cookies are available on disk.
 func hasSSOCookies() bool {
-	_, err := os.Stat(ssoCookiesFile)
+	return hasSSOCookiesFor("")
+}
+
+// hasSSOCookiesFor checks if SSO cookies exist for the given account.
+func hasSSOCookiesFor(accountID string) bool {
+	_, err := os.Stat(ssoCookiesFileFor(accountID))
 	return err == nil
 }
 
 func loadM365CookieStore() (*m365CookieStore, error) {
-	data, err := os.ReadFile(m365CookiesFile)
+	return loadM365CookieStoreFor("")
+}
+
+func loadM365CookieStoreFor(accountID string) (*m365CookieStore, error) {
+	data, err := os.ReadFile(m365CookiesFileFor(accountID))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
 	}
@@ -281,7 +375,7 @@ func loadM365CookieStore() (*m365CookieStore, error) {
 		ExtractedAt: time.Now(),
 		Cookies:     legacyData.Cookies,
 	}
-	if err := saveM365CookieStore(legacyStore); err != nil {
+	if err := saveM365CookieStoreFor(accountID, legacyStore); err != nil {
 		return nil, fmt.Errorf("%w: failed to migrate M365 cookies: %v", ErrM365CookiesUnavailable, err)
 	}
 	return &legacyStore, nil
@@ -312,22 +406,22 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 	return strings.Join(cookieParts, "; "), nil
 }
 
-// reauthWithSSO performs silent re-authentication using stored SSO cookies.
-// It uses the OAuth2 authorize endpoint with prompt=none and PKCE.
+// ReauthWithSSOCookies performs silent re-authentication using the given SSO
+// cookies. It uses the OAuth2 authorize endpoint with prompt=none and PKCE.
 // If the SSO session is still valid, it returns new access and refresh tokens.
-func (tm *TokenManager) reauthWithSSO() (string, error) {
-	logging.Info("reauthWithSSO: starting SSO cookie re-authentication")
-	store, err := tm.loadSSOCookies()
-	if err != nil {
-		logging.Errorf("reauthWithSSO: no SSO cookies available: %v", err)
-		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
+// It is the reusable core behind reauthWithSSO and the per-account account-pool
+// fallback; it does not touch any TokenManager files.
+func ReauthWithSSOCookies(tenant, clientID, scope string, cookies []SSOCookie) (accessToken, refreshToken string, expiresIn int, err error) {
+	logging.Infof("reauthWithSSO: starting SSO cookie re-authentication for tenant %s", tenant)
+	if len(cookies) == 0 {
+		return "", "", 0, fmt.Errorf("%w: no SSO cookies available", ErrRefreshFailed)
 	}
 
-	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s", len(store.Cookies), store.CapturedAt.Format(time.RFC3339))
+	logging.Debugf("reauthWithSSO: using %d SSO cookies", len(cookies))
 
 	// Build Cookie header string from SSO cookies
 	var cookieParts []string
-	for _, c := range store.Cookies {
+	for _, c := range cookies {
 		cookieParts = append(cookieParts, c.Name+"="+c.Value)
 	}
 	cookieHeader := strings.Join(cookieParts, "; ")
@@ -343,18 +437,18 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	// Generate PKCE
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 
 	// Build authorize URL for silent auth using SSO cookies
 	// sso_reload=True tells the server to use SSO cookies and skip the BssoInterrupt page.
 	// prompt=none breaks SSO cookie recognition, so we omit it.
-	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
+	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tenant)
 	params := url.Values{
-		"client_id":             {tm.clientID},
+		"client_id":             {clientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {defaultRedirectURI},
-		"scope":                 {tm.scope + " offline_access"},
+		"scope":                 {scope + " offline_access"},
 		"response_mode":         {"fragment"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
@@ -364,7 +458,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to create authorize request: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: failed to create authorize request: %v", ErrRefreshFailed, err)
 	}
 	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 	authReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
@@ -373,7 +467,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 
 	authResp, err := client.Do(authReq)
 	if err != nil {
-		return "", fmt.Errorf("%w: authorize request failed: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: authorize request failed: %v", ErrRefreshFailed, err)
 	}
 	defer authResp.Body.Close()
 
@@ -391,7 +485,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 				if len(bodyStr) > 2000 {
 					bodyStr = bodyStr[:2000]
 				}
-				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
+				return "", "", 0, fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
 			}
 		}
 
@@ -400,7 +494,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 			// Parse auth code from redirect URL
 			locURL, err := url.Parse(location)
 			if err != nil {
-				return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
+				return "", "", 0, fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
 			}
 
 			authCode := locURL.Query().Get("code")
@@ -413,21 +507,21 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 					if authCode == "" {
 						errCode := fragParams.Get("error")
 						errDesc := fragParams.Get("error_description")
-						return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
+						return "", "", 0, fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
 					}
 				}
 			}
 			if authCode != "" {
 				// Exchange auth code for tokens
 				logging.Info("reauthWithSSO: obtained auth code, exchanging for tokens")
-				return tm.exchangeAuthCode(authCode, verifier)
+				return exchangeAuthCodeTokens(clientID, scope, tenant, authCode, verifier)
 			}
 		}
 
 		// Follow the redirect
 		redirectReq, err := http.NewRequest("GET", location, nil)
 		if err != nil {
-			return "", fmt.Errorf("%w: failed to create redirect request: %v", ErrRefreshFailed, err)
+			return "", "", 0, fmt.Errorf("%w: failed to create redirect request: %v", ErrRefreshFailed, err)
 		}
 		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 		redirectReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
@@ -437,7 +531,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		currentResp.Body.Close()
 		currentResp, err = client.Do(redirectReq)
 		if err != nil {
-			return "", fmt.Errorf("%w: redirect request failed: %v", ErrRefreshFailed, err)
+			return "", "", 0, fmt.Errorf("%w: redirect request failed: %v", ErrRefreshFailed, err)
 		}
 		defer currentResp.Body.Close()
 	}
@@ -515,20 +609,23 @@ func summarizeBrokerAuthorizeResponse(body string) string {
 	return compactBody
 }
 
-// exchangeAuthCode exchanges an authorization code for access and refresh tokens.
-func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, error) {
+// exchangeAuthCodeTokens exchanges an authorization code for access and
+// refresh tokens. It is the reusable token-exchange core used by both the SSO
+// cookie reauth path and the broker flow; it does not persist anything.
+func exchangeAuthCodeTokens(clientID, scope, tenant, authCode, verifier string) (accessToken, refreshToken string, expiresIn int, err error) {
 	tokenData := url.Values{
-		"client_id":     {tm.clientID},
+		"client_id":     {clientID},
 		"grant_type":    {"authorization_code"},
 		"code":          {authCode},
 		"redirect_uri":  {defaultRedirectURI},
 		"code_verifier": {verifier},
-		"scope":         {tm.scope + " offline_access"},
+		"scope":         {scope + " offline_access"},
 	}
 
-	tokenReq, err := http.NewRequest("POST", tm.tokenURL, strings.NewReader(tokenData.Encode()))
+	tokenURL := fmt.Sprintf(tokenURLTemplate, tenant)
+	tokenReq, err := http.NewRequest("POST", tokenURL, strings.NewReader(tokenData.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to create token request: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: failed to create token request: %v", ErrRefreshFailed, err)
 	}
 	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
 	tokenReq.Header.Set("Origin", "https://m365.cloud.microsoft")
@@ -539,17 +636,17 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, err
 	client := &http.Client{Timeout: 15 * time.Second}
 	tokenResp, err := client.Do(tokenReq)
 	if err != nil {
-		return "", fmt.Errorf("%w: token exchange failed: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: token exchange failed: %v", ErrRefreshFailed, err)
 	}
 	defer tokenResp.Body.Close()
 
 	body, err := io.ReadAll(tokenResp.Body)
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to read token response: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: failed to read token response: %v", ErrRefreshFailed, err)
 	}
 
 	if tokenResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%w: token exchange status %d: %s", ErrRefreshFailed, tokenResp.StatusCode, string(body))
+		return "", "", 0, fmt.Errorf("%w: token exchange status %d: %s", ErrRefreshFailed, tokenResp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -559,29 +656,39 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, err
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("%w: failed to parse token response: %v", ErrRefreshFailed, err)
-	}
-
-	// Save new refresh token if provided
-	if result.RefreshToken != "" {
-		if err := tm.writeRefreshToken(result.RefreshToken); err != nil {
-			return "", fmt.Errorf("%w: failed to save refresh token: %v", ErrRefreshFailed, err)
-		}
-	}
-
-	// Cache access token
-	expiresAt := time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
-	cache := TokenCache{
-		AccessToken: result.AccessToken,
-		ExpiresAt:   expiresAt.Unix(),
-	}
-
-	if err := tm.writeCache(cache); err != nil {
-		return "", fmt.Errorf("%w: failed to write cache: %v", ErrRefreshFailed, err)
+		return "", "", 0, fmt.Errorf("%w: failed to parse token response: %v", ErrRefreshFailed, err)
 	}
 
 	logging.Infof("exchangeAuthCode: success, expires_in=%d", result.ExpiresIn)
-	return result.AccessToken, nil
+	return result.AccessToken, result.RefreshToken, result.ExpiresIn, nil
+}
+
+// reauthWithSSO performs silent re-authentication using stored SSO cookies and
+// persists the resulting tokens. This is the TokenManager method used by the
+// legacy single-account data plane; the account pool uses the standalone
+// ReauthWithSSOCookies through its own hook instead.
+func (tm *TokenManager) reauthWithSSO() (string, error) {
+	store, err := loadSSOCookieStore()
+	if err != nil {
+		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
+	}
+	accessToken, refreshToken, expiresIn, err := ReauthWithSSOCookies(tm.tenant, tm.clientID, tm.scope, store.Cookies)
+	if err != nil {
+		logging.Errorf("reauthWithSSO: failed: %v", err)
+		return "", err
+	}
+	if refreshToken != "" {
+		if werr := tm.writeRefreshToken(refreshToken); werr != nil {
+			logging.Errorf("reauthWithSSO: failed to save refresh token: %v", werr)
+		}
+	}
+	if expiresIn > 0 {
+		expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
+		if werr := tm.writeCache(TokenCache{AccessToken: accessToken, ExpiresAt: expiresAt.Unix()}); werr != nil {
+			logging.Errorf("reauthWithSSO: failed to write cache: %v", werr)
+		}
+	}
+	return accessToken, nil
 }
 
 // designerTokenCacheFile stores the designerapp access token cache.

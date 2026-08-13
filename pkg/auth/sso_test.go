@@ -315,3 +315,81 @@ func TestSSOStatusEmptyWhenNoCookies(t *testing.T) {
 		t.Fatalf("expected zero counts, got %+v", status)
 	}
 }
+
+func TestSaveSSOCookieBatchForIsolatesAccounts(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+
+	accA := "11111111-1111-1111-1111-111111111111"
+	accB := "22222222-2222-2222-2222-222222222222"
+	cookies := []SSOCookie{
+		{Name: "ESTSAUTH", Value: "a-login", Domain: "login.microsoftonline.com"},
+		{Name: "ccs", Value: "a-m365", Domain: "m365.cloud.microsoft"},
+	}
+	loginCount, m365Count, err := SaveSSOCookieBatchFor(accA, cookies)
+	if err != nil {
+		t.Fatalf("SaveSSOCookieBatchFor: %v", err)
+	}
+	if loginCount != 1 || m365Count != 1 {
+		t.Fatalf("unexpected counts: login=%d m365=%d", loginCount, m365Count)
+	}
+
+	if status := SSOStatusFor(accA); !status.LoginAvailable || status.LoginCookies != 1 || !status.M365Available || status.M365Cookies != 1 {
+		t.Fatalf("account A status wrong: %+v", status)
+	}
+	if status := SSOStatusFor(accB); status.LoginAvailable || status.M365Available {
+		t.Fatalf("account B must be isolated, got %+v", status)
+	}
+	if status := SSOStatus(); status.LoginAvailable || status.M365Available {
+		t.Fatalf("global store must stay empty, got %+v", status)
+	}
+
+	if _, err := os.Stat(ssoCookiesFileFor(accA)); err != nil {
+		t.Fatalf("account A login store missing: %v", err)
+	}
+	if _, err := os.Stat(ssoCookiesFileFor(accB)); err == nil {
+		t.Fatal("account B login store must not exist")
+	}
+	if _, err := os.Stat(ssoCookiesFile); err == nil {
+		t.Fatal("global login store must not exist")
+	}
+
+	storeA, err := loadSSOCookieStoreFor(accA)
+	if err != nil {
+		t.Fatalf("load account A login cookies: %v", err)
+	}
+	if len(storeA.Cookies) != 1 || storeA.Cookies[0].Value != "a-login" {
+		t.Fatalf("unexpected account A login cookies: %+v", storeA.Cookies)
+	}
+
+	storeB, err := loadSSOCookieStoreFor(accB)
+	if err == nil {
+		t.Fatalf("account B load must fail, got %+v", storeB)
+	}
+}
+
+func TestSSOCookiePathSanitizesAccountID(t *testing.T) {
+	if got := ssoCookiesFileFor("user@example.com"); !strings.Contains(got, "user_example_com") {
+		t.Fatalf("expected sanitised path, got %q", got)
+	}
+	if got := ssoCookiesFileFor(""); got != ssoCookiesFile {
+		t.Fatalf("empty account id must map to global file, got %q", got)
+	}
+}
+
+func TestLoadSSOCookiesForReturnsStore(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	acc := "33333333-3333-3333-3333-333333333333"
+	if err := SaveSSOCookiesFor(acc, []SSOCookie{{Name: "ESTSAUTH", Value: "v", Domain: "login.microsoftonline.com"}}); err != nil {
+		t.Fatalf("save cookies: %v", err)
+	}
+	store, err := LoadSSOCookiesFor(acc)
+	if err != nil {
+		t.Fatalf("load cookies: %v", err)
+	}
+	if len(store.Cookies) != 1 || store.Cookies[0].Value != "v" {
+		t.Fatalf("unexpected store: %+v", store.Cookies)
+	}
+	if _, err := LoadSSOCookiesFor("missing-account"); err == nil {
+		t.Fatal("missing account must fail to load")
+	}
+}

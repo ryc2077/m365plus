@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ryc2077/m365plus/pkg/accounts"
+	"github.com/ryc2077/m365plus/pkg/auth"
 )
 
 // ModelTester is the hook the data plane registers so the admin console can
@@ -183,6 +184,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt   time.Time `json:"expiresAt"`
 		UpdatedAt   time.Time `json:"updatedAt"`
 		Active      bool      `json:"active"`
+		SSO         ssoView   `json:"sso"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -191,9 +193,33 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 			Active: a.ID == activeID,
+			SSO:    ssoStatusFor(a.ID),
 		})
 	}
 	jsonOut(w, map[string]any{"accounts": out})
+}
+
+// ssoView is the per-account SSO cookie state shown in the account list. Cookie
+// values are never exposed, only counts and capture timestamps.
+type ssoView struct {
+	LoginAvailable bool      `json:"loginAvailable"`
+	LoginCookies   int       `json:"loginCookies"`
+	LoginCaptured  time.Time `json:"loginCapturedAt,omitempty"`
+	M365Available  bool      `json:"m365Available"`
+	M365Cookies    int       `json:"m365Cookies"`
+	M365Captured   time.Time `json:"m365CapturedAt,omitempty"`
+}
+
+func ssoStatusFor(accountID string) ssoView {
+	st := auth.SSOStatusFor(accountID)
+	return ssoView{
+		LoginAvailable: st.LoginAvailable,
+		LoginCookies:   st.LoginCookies,
+		LoginCaptured:  st.LoginCaptured,
+		M365Available:  st.M365Available,
+		M365Cookies:    st.M365Cookies,
+		M365Captured:   st.M365Captured,
+	}
 }
 
 // switchToAccount pins the active rotation account to the requested id and
