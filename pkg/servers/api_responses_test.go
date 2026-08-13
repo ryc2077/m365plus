@@ -2,6 +2,7 @@ package servers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,10 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ryc2077/m365plus/pkg/client"
 	"github.com/ryc2077/m365plus/pkg/payload"
 	"github.com/ryc2077/m365plus/pkg/toolcalling"
-	"github.com/google/uuid"
 )
 
 func responsesTestTools() []toolcalling.ToolDef {
@@ -430,6 +431,93 @@ func TestBuildResponsesToolCallItemIncludesNamespace(t *testing.T) {
 	}
 	if item["name"] != "js" {
 		t.Fatalf("function_call name = %#v", item["name"])
+	}
+}
+
+func TestBuildResponsesToolCallItemCustomTool(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_exec",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "exec",
+			Namespace: "functions",
+			Arguments: `{"input":"await tools.exec_command({cmd:'ls -la'})"}`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_exec",
+		call,
+		map[string]string{"functions/exec": "custom"},
+		"completed",
+	)
+
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("custom item type = %#v, want custom_tool_call", item["type"])
+	}
+	if item["name"] != "exec" {
+		t.Fatalf("custom item name = %#v", item["name"])
+	}
+	if item["namespace"] != "functions" {
+		t.Fatalf("custom item namespace = %#v", item["namespace"])
+	}
+	if input, ok := item["input"].(string); !ok || input != "await tools.exec_command({cmd:'ls -la'})" {
+		t.Fatalf("custom item input = %#v", item["input"])
+	}
+	if _, ok := item["arguments"]; ok {
+		t.Fatalf("custom item should not carry arguments: %#v", item["arguments"])
+	}
+}
+
+func TestBuildResponsesToolCallItemCustomToolBareInput(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_exec",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "exec",
+			Namespace: "functions",
+			Arguments: `await tools.exec_command({"cmd":"cat > /tmp/a.html"})`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_exec",
+		call,
+		map[string]string{"functions/exec": "custom"},
+		"completed",
+	)
+
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("custom item type = %#v, want custom_tool_call", item["type"])
+	}
+	if input, ok := item["input"].(string); !ok || input != `await tools.exec_command({"cmd":"cat > /tmp/a.html"})` {
+		t.Fatalf("custom item input = %#v", item["input"])
+	}
+}
+
+func TestBuildResponsesToolCallItemCustomToolInProgress(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_exec",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "exec",
+			Namespace: "functions",
+			Arguments: `{"input":"await tools.exec_command({cmd:'ls'})"}`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_exec",
+		call,
+		map[string]string{"functions/exec": "custom"},
+		"in_progress",
+	)
+
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("custom item type = %#v, want custom_tool_call", item["type"])
+	}
+	if input, ok := item["input"].(string); !ok || input != "" {
+		t.Fatalf("in-progress custom item input = %#v, want empty string", item["input"])
 	}
 }
 
@@ -1513,5 +1601,167 @@ func TestParseModelSessionIDExPersist(t *testing.T) {
 	key, sid, _ = parseModelSessionIDEx("")
 	if key != "gpt5.5-reasoning" {
 		t.Fatalf("empty model fallback: %q", key)
+	}
+}
+
+func TestResponsesInputImageDataURLParsed(t *testing.T) {
+	img := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("fake-png-bytes"))
+	input := []any{
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "describe this image"},
+				map[string]any{"type": "input_image", "image_url": img},
+			},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 {
+		t.Fatalf("message count = %d", len(messages))
+	}
+	msg := messages[0]
+	if msg.Content != "describe this image" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if len(msg.Images) != 1 {
+		t.Fatalf("image count = %d", len(msg.Images))
+	}
+	if msg.Images[0].MediaType != "image/png" {
+		t.Fatalf("media type = %q", msg.Images[0].MediaType)
+	}
+	if msg.Images[0].FileName != "upload.png" {
+		t.Fatalf("file name = %q", msg.Images[0].FileName)
+	}
+	if msg.Images[0].Base64 != base64.StdEncoding.EncodeToString([]byte("fake-png-bytes")) {
+		t.Fatalf("base64 mismatch")
+	}
+}
+
+func TestResponsesInputImageNestedURLObj(t *testing.T) {
+	img := "data:image/webp;base64," + base64.StdEncoding.EncodeToString([]byte("fake-webp"))
+	input := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_image", "image_url": map[string]any{"url": img, "detail": "auto"}}},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 || len(messages[0].Images) != 1 {
+		t.Fatalf("expected 1 message with 1 image, got %#v", messages)
+	}
+	if messages[0].Images[0].MediaType != "image/webp" {
+		t.Fatalf("media type = %q", messages[0].Images[0].MediaType)
+	}
+}
+
+func TestResponsesInputImageLocalPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	raw := []byte("local-file-png")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_image", "image_url": path}},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 || len(messages[0].Images) != 1 {
+		t.Fatalf("expected 1 message with 1 image, got %#v", messages)
+	}
+	img := messages[0].Images[0]
+	if img.Base64 != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("local image base64 mismatch")
+	}
+	if img.FileName != "photo.png" {
+		t.Fatalf("local file name = %q", img.FileName)
+	}
+}
+
+func TestResponsesInputImageMissingPathIgnored(t *testing.T) {
+	input := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_image", "image_url": "/nonexistent/path/img.png"}},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 {
+		t.Fatalf("message count = %d", len(messages))
+	}
+	if len(messages[0].Images) != 0 {
+		t.Fatalf("expected 0 images for missing path, got %d", len(messages[0].Images))
+	}
+}
+
+func TestResponsesInputImageHTTPDownloaded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("http-png-bytes"))
+	}))
+	defer srv.Close()
+	input := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_image", "image_url": srv.URL}},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 || len(messages[0].Images) != 1 {
+		t.Fatalf("expected 1 message with 1 image, got %#v", messages)
+	}
+	img := messages[0].Images[0]
+	if img.MediaType != "image/png" {
+		t.Fatalf("http media type = %q", img.MediaType)
+	}
+	if img.Base64 != base64.StdEncoding.EncodeToString([]byte("http-png-bytes")) {
+		t.Fatalf("http image base64 mismatch")
+	}
+}
+
+func TestResponsesInputImageMissingFieldIgnored(t *testing.T) {
+	input := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_image"}},
+		},
+	}
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 || len(messages[0].Images) != 0 {
+		t.Fatalf("expected 0 images, got %#v", messages)
+	}
+}
+
+func TestBuildOpenAIImageDataURLFormatPassesThrough(t *testing.T) {
+	api := &APIServer{}
+	respText := "Here is your image:\n\n![generated](https://designerapp.officeapps.live.com/designerapp/document.ashx?path=%2Fabc%2FDallEGeneratedImages%2Fdalle-123.png&fileToken=abc123)\n"
+	items := api.buildOpenAIImageData(respText, 1, "prompt", "url")
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].B64JSON != "" {
+		t.Fatalf("url format must not download to b64_json, got %q", items[0].B64JSON)
+	}
+	if !strings.HasPrefix(items[0].URL, "https://designerapp.officeapps.live.com/") {
+		t.Fatalf("url must pass through untouched, got %q", items[0].URL)
+	}
+	if items[0].RevisedPrompt != "prompt" {
+		t.Fatalf("revised prompt mismatch")
+	}
+}
+
+func TestBuildOpenAIImageDataEmptyResponse(t *testing.T) {
+	api := &APIServer{}
+	items := api.buildOpenAIImageData("no image here", 1, "", "url")
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %d", len(items))
 	}
 }

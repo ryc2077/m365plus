@@ -92,6 +92,14 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 			"Do not use code_interpreter, web_search, or another built-in tool unless its exact name is in the callable set.",
 		)
 
+		if strings.Contains(requestJSON, `"type":"custom"`) {
+			lines = append(lines,
+				`A tool entry with "type": "custom" is a freeform JavaScript tool: its arguments value must be raw JS source text (not a JSON object), such as "await tools.exec_command({cmd: 'pwd'});".`,
+				`For a "type": "custom" freeform tool, always surface the nested tool's result through the global text(...) helper so the caller receives it. Capture the awaited return value and emit it, e.g. "const r = await tools.exec_command({cmd: 'pwd'}); text(r.output);". A bare "await tools.exec_command(...)" discards the returned output.`,
+				`Prefer the custom tool's nested functions (documented on the tools object, e.g. tools.exec_command) over top-level JSON-schema tools when the custom tool exposes a matching capability.`,
+			)
+		}
+
 		normalizedChoice := strings.TrimSpace(toolChoice)
 		switch strings.ToLower(normalizedChoice) {
 		case "required":
@@ -590,7 +598,6 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 		if ns, ok := fn["namespace"].(string); ok && ns != "" {
 			namespace = ns
 		}
-		args = normalizeArgumentsJSON(fn["arguments"])
 		if i, ok := tc["id"].(string); ok && i != "" {
 			id = i
 		}
@@ -605,9 +612,25 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 			namespace = ns
 		}
 	}
-	if args == "" {
-		args = normalizeArgumentsJSON(tc["arguments"])
+	// Pick the first non-nil arguments source. M365 varies between the
+	// standard "arguments" key, a "function.arguments" key on the wrapper or
+	// inside the function object, and the OpenAI wrapper's function.arguments.
+	var argumentsNode any
+	if fn, ok := tc["function"].(map[string]any); ok {
+		if fa, ok := fn["arguments"]; ok {
+			argumentsNode = fa
+		} else if fa, ok := fn["function.arguments"]; ok {
+			argumentsNode = fa
+		}
 	}
+	if argumentsNode == nil {
+		if a, ok := tc["arguments"]; ok {
+			argumentsNode = a
+		} else if fa, ok := tc["function.arguments"]; ok {
+			argumentsNode = fa
+		}
+	}
+	args = normalizeArgumentsJSON(argumentsNode)
 	if id == "" {
 		if i, ok := tc["id"].(string); ok && i != "" {
 			id = i

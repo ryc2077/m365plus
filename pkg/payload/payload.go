@@ -184,7 +184,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			// OpenAI format: {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
 			if imgURL, ok := block["image_url"].(map[string]any); ok {
 				if url, ok := imgURL["url"].(string); ok {
-					if img := parseDataURL(url); img != nil {
+					if img := ParseDataURL(url); img != nil {
 						m.Images = append(m.Images, *img)
 					}
 				}
@@ -233,8 +233,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// parseDataURL parses a data URL (data:image/png;base64,...) and returns ImageData.
-func parseDataURL(url string) *ImageData {
+// ParseDataURL parses a data URL (data:image/png;base64,...) and returns ImageData.
+func ParseDataURL(url string) *ImageData {
 	const prefix = "data:"
 	if !strings.HasPrefix(url, prefix) {
 		return nil
@@ -425,7 +425,7 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, includ
 // one per request from the persisted SessionState and hands it to the client
 // via M365Client.WithSession.
 type SessionTurn struct {
-	ClientSessionID string
+	ClientSessionID  string
 	IsStartOfSession bool
 }
 

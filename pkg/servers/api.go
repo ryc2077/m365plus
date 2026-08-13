@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/pkoukk/tiktoken-go"
 	"github.com/ryc2077/m365plus/pkg/auth"
 	"github.com/ryc2077/m365plus/pkg/client"
 	"github.com/ryc2077/m365plus/pkg/codingtools"
@@ -29,8 +31,6 @@ import (
 	"github.com/ryc2077/m365plus/pkg/models"
 	"github.com/ryc2077/m365plus/pkg/payload"
 	"github.com/ryc2077/m365plus/pkg/toolcalling"
-	"github.com/google/uuid"
-	"github.com/pkoukk/tiktoken-go"
 )
 
 const (
@@ -3143,6 +3143,24 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 			"arguments": arguments,
 		}
 	}
+	if toolTypes[toolKey] == "custom" {
+		item := map[string]any{
+			"id":      callID,
+			"type":    "custom_tool_call",
+			"status":  status,
+			"call_id": callID,
+			"name":    call.Function.Name,
+		}
+		if call.Function.Namespace != "" {
+			item["namespace"] = call.Function.Namespace
+		}
+		if status == "completed" {
+			item["input"] = extractCustomToolInput(call.Function.Arguments)
+		} else {
+			item["input"] = ""
+		}
+		return item
+	}
 	item := map[string]any{
 		"id":      callID,
 		"type":    "function_call",
@@ -3159,6 +3177,32 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 		item["arguments"] = ""
 	}
 	return item
+}
+
+// extractCustomToolInput recovers the raw freeform input text for a custom
+// tool call. Upstream chat-completion-style responses wrap the freeform text
+// either as a JSON object {"input": "..."} or as a bare JavaScript source
+// string. This normalizes both shapes to the raw text expected by Responses
+// API custom_tool_call items.
+func extractCustomToolInput(arguments string) string {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return ""
+	}
+	var probe any
+	if json.Unmarshal([]byte(trimmed), &probe) == nil {
+		if obj, ok := probe.(map[string]any); ok {
+			if input, ok := obj["input"].(string); ok && strings.TrimSpace(input) != "" {
+				return strings.TrimSpace(input)
+			}
+			if input, ok := obj["input"].(any); ok {
+				if s, err := json.Marshal(input); err == nil {
+					return strings.Trim(string(s), `"`)
+				}
+			}
+		}
+	}
+	return trimmed
 }
 
 func resolveResponsesToolNamespace(
@@ -3902,6 +3946,42 @@ func responsesInputToMessages(input any) []payload.Message {
 			continue
 		}
 
+		// Handle custom_tool_call items (freeform custom tool calls)
+		if itemType == "custom_tool_call" {
+			name, _ := m["name"].(string)
+			namespace, _ := m["namespace"].(string)
+			input, _ := m["input"].(string)
+			qualifiedName := name
+			if namespace != "" {
+				qualifiedName = namespace + "/" + name
+			}
+			messages = append(messages, payload.Message{
+				Role:    "assistant",
+				Content: fmt.Sprintf("Tool call: %s(%s)", qualifiedName, input),
+			})
+			continue
+		}
+
+		// Handle custom_tool_call_output items (freeform tool results)
+		if itemType == "custom_tool_call_output" {
+			callID, _ := m["call_id"].(string)
+			output, _ := m["output"].(string)
+			if output == "" && m["output"] != nil {
+				encoded, _ := json.Marshal(m["output"])
+				output = string(encoded)
+			}
+			messages = append(messages, payload.Message{
+				Role: "tool",
+				Content: fmt.Sprintf(
+					"Authoritative tool result (call_id: %s):\n%s",
+					callID,
+					output,
+				),
+				ToolCallID: callID,
+			})
+			continue
+		}
+
 		// Handle reasoning items (skip, M365 generates its own)
 		if itemType == "reasoning" {
 			continue
@@ -3951,10 +4031,11 @@ func responsesInputToMessages(input any) []payload.Message {
 			role = "user"
 		}
 
-		content := responsesExtractContent(m["content"])
+		content, images := responsesExtractContentParts(m["content"])
 		messages = append(messages, payload.Message{
 			Role:    role,
 			Content: content,
+			Images:  images,
 		})
 	}
 
@@ -3967,17 +4048,29 @@ func responsesInputToMessages(input any) []payload.Message {
 // responsesExtractContent extracts text from a content field that may be a
 // string or an array of content parts (input_text, output_text, text types).
 func responsesExtractContent(content any) string {
+	text, _ := responsesExtractContentParts(content)
+	return text
+}
+
+// responsesExtractContentParts extracts text and image data from a content
+// field that may be a string or an array of content parts. It supports the
+// text variants (input_text, output_text, text) as well as multimodal image
+// parts (input_image with an image_url that may be a data URL, an HTTP(S)
+// URL, or a local file path). Images are returned as payload.ImageData so the
+// caller can attach them to a payload.Message for upload to the M365 backend.
+func responsesExtractContentParts(content any) (string, []payload.ImageData) {
 	if content == nil {
-		return ""
+		return "", nil
 	}
 	if s, ok := content.(string); ok {
-		return s
+		return s, nil
 	}
 	arr, ok := content.([]any)
 	if !ok {
-		return ""
+		return "", nil
 	}
 	var parts []string
+	var images []payload.ImageData
 	for _, part := range arr {
 		p, ok := part.(map[string]any)
 		if !ok {
@@ -3988,9 +4081,94 @@ func responsesExtractContent(content any) string {
 			if text, ok := p["text"].(string); ok {
 				parts = append(parts, text)
 			}
+			continue
+		}
+		if ptype == "input_image" {
+			if img := imageDataFromContentPart(p); img != nil {
+				images = append(images, *img)
+			}
 		}
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(parts, "\n"), images
+}
+
+// imageDataFromContentPart extracts payload.ImageData from an input_image
+// content part. The image_url value may be a base64 data URL, an HTTP(S)
+// URL, or a local file path on the server.
+func imageDataFromContentPart(p map[string]any) *payload.ImageData {
+	if urlValue, ok := p["image_url"].(string); ok {
+		if img := imageDataFromImageURL(urlValue); img != nil {
+			return img
+		}
+	}
+	// OpenAI Responses API also accepts a nested {"url": ...} object.
+	if urlObj, ok := p["image_url"].(map[string]any); ok {
+		if urlValue, ok := urlObj["url"].(string); ok {
+			return imageDataFromImageURL(urlValue)
+		}
+	}
+	return nil
+}
+
+// imageDataFromImageURL resolves an image_url value into payload.ImageData.
+// It handles base64 data URLs, local file paths, and HTTP(S) URLs (which are
+// downloaded and converted to base64).
+func imageDataFromImageURL(urlValue string) *payload.ImageData {
+	if strings.HasPrefix(urlValue, "data:") {
+		return payload.ParseDataURL(urlValue)
+	}
+	if strings.HasPrefix(urlValue, "http://") || strings.HasPrefix(urlValue, "https://") {
+		return imageDataFromHTTPURL(urlValue)
+	}
+	// Local file path on the server (used by clients that pass file paths).
+	return imageDataFromLocalPath(urlValue)
+}
+
+// imageDataFromLocalPath reads a local image file and converts it to
+// payload.ImageData.
+func imageDataFromLocalPath(path string) *payload.ImageData {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		logging.Warnf("imageDataFromLocalPath: cannot read image file %s: %v", path, err)
+		return nil
+	}
+	mediaType := http.DetectContentType(data)
+	return &payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(data),
+		MediaType: mediaType,
+		FileName:  filepath.Base(path),
+	}
+}
+
+// imageDataFromHTTPURL downloads an image from an HTTP(S) URL and converts it
+// to payload.ImageData.
+func imageDataFromHTTPURL(rawURL string) *payload.ImageData {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		logging.Warnf("imageDataFromHTTPURL: download failed for %s: %v", rawURL, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logging.Warnf("imageDataFromHTTPURL: download returned status %d for %s", resp.StatusCode, rawURL)
+		return nil
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logging.Warnf("imageDataFromHTTPURL: failed to read body for %s: %v", rawURL, err)
+		return nil
+	}
+	mediaType := resp.Header.Get("Content-Type")
+	if mediaType == "" || mediaType == "application/octet-stream" {
+		mediaType = http.DetectContentType(data)
+	}
+	name := "upload." + extFromMediaType(mediaType)
+	return &payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(data),
+		MediaType: mediaType,
+		FileName:  name,
+	}
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
@@ -4940,18 +5118,33 @@ func (api *APIServer) streamResponses(
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
 			})
+			isCustom := toolTypes[toolKey] == "custom"
 			if !isToolSearch {
-				sendEvent("response.function_call_arguments.delta", map[string]any{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"delta":        tc.Function.Arguments,
-				})
-				sendEvent("response.function_call_arguments.done", map[string]any{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"name":         tc.Function.Name,
-					"arguments":    tc.Function.Arguments,
-				})
+				if isCustom {
+					sendEvent("response.custom_tool_call_input.delta", map[string]any{
+						"item_id":      callID,
+						"output_index": outputIdx,
+						"delta":        tc.Function.Arguments,
+					})
+					sendEvent("response.custom_tool_call_input.done", map[string]any{
+						"item_id":      callID,
+						"output_index": outputIdx,
+						"input":        extractCustomToolInput(tc.Function.Arguments),
+						"name":         tc.Function.Name,
+					})
+				} else {
+					sendEvent("response.function_call_arguments.delta", map[string]any{
+						"item_id":      callID,
+						"output_index": outputIdx,
+						"delta":        tc.Function.Arguments,
+					})
+					sendEvent("response.function_call_arguments.done", map[string]any{
+						"item_id":      callID,
+						"output_index": outputIdx,
+						"name":         tc.Function.Name,
+						"arguments":    tc.Function.Arguments,
+					})
+				}
 			}
 			sendEvent("response.output_item.done", map[string]any{
 				"output_index": outputIdx,
@@ -5648,11 +5841,10 @@ func buildImagePromptWithHints(prompt, size, quality, style string) string {
 }
 
 // buildOpenAIImageData extracts image URLs from markdown in the response text
-// and converts them to OpenAI Images API data items. When responseFormat is
-// "b64_json", it downloads each URL and base64-encodes the content. When
-// responseFormat is "url", it also downloads the image and returns a
-// data:image/png;base64,... data URL (falling back to the raw URL on error)
-// since the raw designerapp URL is auth-gated and inaccessible to clients.
+// and converts them to OpenAI Images API data items. The default "url" format
+// passes the upstream image URL through untouched (matching M365-Copilot2API
+// behavior, no SSO cookies required). The "b64_json" format downloads each URL
+// and base64-encodes the content.
 func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
 	urls := urlImagePattern.FindAllStringSubmatch(respText, -1)
 	if len(urls) == 0 {
@@ -5691,19 +5883,11 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 				RevisedPrompt: revisedPrompt,
 			})
 		} else {
-			// url format: try to download and return as data URL;
-			// fall back to raw URL on error
-			b64, err := api.downloadAndBase64(u)
-			if err != nil {
-				logging.Errorf("Failed to download image for data URL %s: %v", u, err)
-				items = append(items, imageDataItem{
-					URL:           u,
-					RevisedPrompt: revisedPrompt,
-				})
-				continue
-			}
+			// url format (default): pass the upstream URL through untouched,
+			// matching M365-Copilot2API behavior. No download, no designer
+			// token, no SSO cookies required.
 			items = append(items, imageDataItem{
-				URL:           "data:image/png;base64," + b64,
+				URL:           u,
 				RevisedPrompt: revisedPrompt,
 			})
 		}

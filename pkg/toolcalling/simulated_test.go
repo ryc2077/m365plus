@@ -332,6 +332,25 @@ func TestParseSimulatedResponseReportsDroppedMissingArgs(t *testing.T) {
 	}
 }
 
+func TestParseSimulatedResponseReadsFunctionDotArgumentsKey(t *testing.T) {
+	raw := "```json\n" +
+		`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"running","tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec"},"namespace":"functions","function.arguments":"const r = await tools.exec_command({cmd:'pwd'}); text(JSON.stringify(r));"}]}}]}` +
+		"\n```"
+
+	result := ParseSimulatedResponse(raw, []string{"exec"}, nil)
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.ToolCalls))
+	}
+	want := "const r = await tools.exec_command({cmd:'pwd'}); text(JSON.stringify(r));"
+	if string(result.ToolCalls[0].Arguments) != want {
+		t.Fatalf("arguments = %q, want %q", result.ToolCalls[0].Arguments, want)
+	}
+	if result.ToolCalls[0].Namespace != "functions" {
+		t.Fatalf("namespace = %q, want functions", result.ToolCalls[0].Namespace)
+	}
+}
+
 func TestBuildRepairNoteNamesToolsAndRequiredFields(t *testing.T) {
 	note := BuildRepairNote([]string{"Agent", "Agent", ""}, agentRequiredByTool())
 
