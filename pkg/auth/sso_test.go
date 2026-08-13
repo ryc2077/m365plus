@@ -261,3 +261,57 @@ func useTemporaryWorkingDirectory(t *testing.T) {
 		t.Fatalf("create token directory: %v", err)
 	}
 }
+
+func TestSaveSSOCookieBatchSplitsByDomain(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+
+	cookies := []SSOCookie{
+		{Name: "ESTSAUTH", Value: "v1", Domain: "login.microsoftonline.com"},
+		{Name: "ESTSAUTHPERSISTENT", Value: "v2", Domain: "login.microsoftonline.com"},
+		{Name: "ccs", Value: "v3", Domain: "m365.cloud.microsoft"},
+		{Name: "MC1", Value: "v4", Domain: "microsoft.com"},
+		{Name: "Other", Value: "v5", Domain: "example.com"},
+	}
+
+	loginCount, m365Count, err := SaveSSOCookieBatch(cookies)
+	if err != nil {
+		t.Fatalf("SaveSSOCookieBatch: %v", err)
+	}
+	if loginCount != 2 {
+		t.Errorf("expected 2 login cookies, got %d", loginCount)
+	}
+	if m365Count != 2 {
+		t.Errorf("expected 2 m365 cookies, got %d", m365Count)
+	}
+
+	status := SSOStatus()
+	if !status.LoginAvailable || status.LoginCookies != 2 {
+		t.Errorf("unexpected login status: %+v", status)
+	}
+	if !status.M365Available || status.M365Cookies != 2 {
+		t.Errorf("unexpected m365 status: %+v", status)
+	}
+
+	store, err := loadSSOCookieStore()
+	if err != nil {
+		t.Fatalf("load SSO cookies: %v", err)
+	}
+	if len(store.Cookies) != 2 {
+		t.Fatalf("expected 2 stored login cookies, got %d", len(store.Cookies))
+	}
+	if store.Cookies[0].Name != "ESTSAUTH" || store.Cookies[0].Value != "v1" {
+		t.Errorf("unexpected first login cookie: %+v", store.Cookies[0])
+	}
+}
+
+func TestSSOStatusEmptyWhenNoCookies(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+
+	status := SSOStatus()
+	if status.LoginAvailable || status.M365Available {
+		t.Fatalf("expected empty status, got %+v", status)
+	}
+	if status.LoginCookies != 0 || status.M365Cookies != 0 {
+		t.Fatalf("expected zero counts, got %+v", status)
+	}
+}

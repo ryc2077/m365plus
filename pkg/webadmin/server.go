@@ -239,6 +239,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
+	m.HandleFunc("/api/sso", s.ssoCookies)
 	m.HandleFunc("/api/conversations", s.conversations)
 	m.HandleFunc("/api/conversations/delete", s.deleteConversation)
 	m.HandleFunc("/api/conversations/cleanup", s.conversationCleanup)

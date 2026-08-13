@@ -165,8 +165,63 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) (returnErr erro
 	return nil
 }
 
-// loadSSOCookies reads and decrypts SSO cookies from disk.
-func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
+// SSOCookieStatus describes the currently stored SSO cookie state. Cookie
+// values are never exposed, only counts and capture timestamps.
+type SSOCookieStatus struct {
+	LoginAvailable bool      `json:"loginAvailable"`
+	LoginCookies   int       `json:"loginCookies"`
+	LoginCaptured  time.Time `json:"loginCapturedAt,omitempty"`
+	M365Available  bool      `json:"m365Available"`
+	M365Cookies    int       `json:"m365Cookies"`
+	M365Captured   time.Time `json:"m365CapturedAt,omitempty"`
+}
+
+// SSOStatus reports whether SSO and M365 web cookies are stored and how many
+// cookies each store holds, without exposing their values.
+func SSOStatus() SSOCookieStatus {
+	status := SSOCookieStatus{}
+	if store, err := loadSSOCookieStore(); err == nil {
+		status.LoginAvailable = true
+		status.LoginCookies = len(store.Cookies)
+		status.LoginCaptured = store.CapturedAt
+	}
+	if store, err := loadM365CookieStore(); err == nil {
+		status.M365Available = true
+		status.M365Cookies = len(store.Cookies)
+		status.M365Captured = store.ExtractedAt
+	}
+	return status
+}
+
+// SaveSSOCookieBatch splits cookies by domain and stores login cookies in the
+// SSO store and M365 web-app cookies in the M365 store. It returns the count
+// of cookies saved to each store.
+func SaveSSOCookieBatch(cookies []SSOCookie) (loginCount, m365Count int, err error) {
+	var loginCookies, m365Cookies []SSOCookie
+	for _, c := range cookies {
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(c.Domain)), ".")
+		switch domain {
+		case "login.microsoftonline.com":
+			loginCookies = append(loginCookies, c)
+		case "m365.cloud.microsoft", "microsoft.com":
+			m365Cookies = append(m365Cookies, c)
+		}
+	}
+	if len(loginCookies) > 0 {
+		if err := SaveSSOCookies(loginCookies); err != nil {
+			return 0, 0, err
+		}
+	}
+	if len(m365Cookies) > 0 {
+		if err := SaveM365Cookies(m365Cookies); err != nil {
+			return 0, 0, err
+		}
+	}
+	return len(loginCookies), len(m365Cookies), nil
+}
+
+// loadSSOCookieStore reads and decrypts the SSO cookie store from disk.
+func loadSSOCookieStore() (*SSOCookieStore, error) {
 	data, err := os.ReadFile(ssoCookiesFile)
 	if err != nil {
 		return nil, fmt.Errorf("SSO cookies file not found: %w", err)
@@ -183,6 +238,11 @@ func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
 	}
 
 	return &store, nil
+}
+
+// loadSSOCookies reads and decrypts SSO cookies from disk.
+func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
+	return loadSSOCookieStore()
 }
 
 // hasSSOCookies checks if SSO cookies are available on disk.

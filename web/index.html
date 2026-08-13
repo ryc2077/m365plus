@@ -540,6 +540,36 @@ if (response.output_text) {
             <div id="authStatus" style="margin-top:12px"></div>
           </div>
         </div>
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-head"><span class="card-title">SSO cookies</span><span id="ssoStatusBadge" style="font-size:11px;color:var(--muted)"></span></div>
+          <div class="card-body">
+            <div class="onb-steps" style="margin-bottom:16px">
+              <div class="onb-step">
+                <span class="onb-step-num">1</span>
+                <span class="onb-step-icon"><i data-lucide="cookie" style="width:15px;height:15px"></i></span>
+                <span class="onb-step-text"><b>Open DevTools → Application → Cookies</b><p>In a browser logged into m365.cloud.microsoft, inspect cookies on login.microsoftonline.com and m365.cloud.microsoft</p></span>
+              </div>
+              <div class="onb-step">
+                <span class="onb-step-num">2</span>
+                <span class="onb-step-icon"><i data-lucide="clipboard-paste" style="width:15px;height:15px"></i></span>
+                <span class="onb-step-text"><b>Paste cookies as JSON</b><p>Array of {name, value, domain} entries; login.microsoftonline.com cookies enable token auto-renewal</p></span>
+              </div>
+              <div class="onb-step">
+                <span class="onb-step-num">3</span>
+                <span class="onb-step-icon"><i data-lucide="shield-check" style="width:15px;height:15px"></i></span>
+                <span class="onb-step-text"><b>Save</b><p>Cookies are encrypted at rest and used only for silent re-authentication</p></span>
+              </div>
+            </div>
+            <label class="form-label">Cookies JSON</label>
+            <textarea class="form-input" id="ssoCookiesInput" rows="6" spellcheck="false" placeholder='[{"name":"ESTSAUTH","value":"...","domain":"login.microsoftonline.com"},{"name":"...","value":"...","domain":"m365.cloud.microsoft"}]' style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:pre;overflow-x:auto"></textarea>
+            <p class="form-hint" style="margin-top:4px">Login cookies (login.microsoftonline.com) enable token auto-renewal after the 24h refresh-token expiry. M365 web cookies (m365.cloud.microsoft / microsoft.com) enable conversation management.</p>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn primary" onclick="saveSSOCookies()"><i data-lucide="save" style="width:14px;height:14px"></i> Save cookies</button>
+              <button class="btn" onclick="loadSSOStatus()"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> Refresh</button>
+            </div>
+            <div id="ssoStatus" style="margin-top:12px"></div>
+          </div>
+        </div>
         <div class="card">
           <div class="card-head">
             <span class="card-title">Authorized accounts</span>
@@ -769,6 +799,25 @@ const localeText={
   'Add a Microsoft account and create an API key to chat through the OpenAI-compatible API.':'添加 Microsoft 账号、创建 API Key，即可通过 OpenAI 兼容接口对话。',
   'Hide guide':'隐藏入门引导',
   'Add an account':'添加账号',
+  'SSO cookies':'SSO cookies',
+  'Open DevTools → Application → Cookies':'打开开发者工具 → Application → Cookies',
+  'In a browser logged into m365.cloud.microsoft, inspect cookies on login.microsoftonline.com and m365.cloud.microsoft':'在已登录 m365.cloud.microsoft 的浏览器中，查看 login.microsoftonline.com 与 m365.cloud.microsoft 下的 cookies',
+  'Paste cookies as JSON':'以 JSON 粘贴 cookies',
+  'Array of {name, value, domain} entries; login.microsoftonline.com cookies enable token auto-renewal':'格式为 {name, value, domain} 数组；login.microsoftonline.com 的 cookies 可启用 token 自动续期',
+  'Save':'保存',
+  'Cookies are encrypted at rest and used only for silent re-authentication':'Cookies 会被加密存储，仅用于静默重新认证',
+  'Cookies JSON':'Cookies JSON',
+  'Save cookies':'保存 cookies',
+  'Refresh':'刷新',
+  'Login cookies (login.microsoftonline.com) enable token auto-renewal after the 24h refresh-token expiry. M365 web cookies (m365.cloud.microsoft / microsoft.com) enable conversation management.':'login.microsoftonline.com 的登录 cookies 可在 24 小时刷新令牌过期后启用 token 自动续期；m365.cloud.microsoft / microsoft.com 的 M365 Web cookies 可启用会话管理。',
+  'Paste cookie JSON first':'请先粘贴 cookie JSON',
+  'Invalid JSON: ':'无效的 JSON：',
+  'No cookies to save':'没有要保存的 cookies',
+  ' cookie(s) missing name, value or domain':' 个 cookies 缺少 name、value 或 domain',
+  'Not configured':'未配置',
+  'SSO cookies configured':'SSO cookies 已配置',
+  'SSO cookies not configured':'SSO cookies 未配置',
+  'No stored cookies. Paste your browser cookies above to enable token auto-renewal.':'尚未存储 cookies。请在上方粘贴浏览器 cookies 以启用 token 自动续期。',
   'Authorize a Microsoft account and add it to the available pool':'授权 Microsoft 账号，加入可用账号池',
   'Create an API key':'创建 API Key',
   'Create an access key for this application or service':'为你的本应用或服务创建访问密钥',
@@ -1133,6 +1182,48 @@ async function loadAccounts(){
       $('incrementalContext').checked=!!s.settings.incrementalContext;
     }
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
+  loadSSOStatus();
+}
+
+async function loadSSOStatus(){
+  try{
+    const d=await api('/api/sso');
+    const s=d.sso||{};
+    const badge=[];
+    if(s.loginAvailable)badge.push(`${s.loginCookies} login cookie(s)`);
+    if(s.m365Available)badge.push(`${s.m365Cookies} m365 cookie(s)`);
+    $('ssoStatusBadge').textContent=badge.length?('● '+badge.join(' · ')):'Not configured';
+    let html='';
+    if(s.loginAvailable||s.m365Available){
+      const parts=[];
+      if(s.loginAvailable)parts.push(`<b>Login:</b> ${s.loginCookies} cookie(s)${s.loginCapturedAt?' · captured '+new Date(s.loginCapturedAt).toLocaleString():''}`);
+      if(s.m365Available)parts.push(`<b>M365:</b> ${s.m365Cookies} cookie(s)${s.m365CapturedAt?' · captured '+new Date(s.m365CapturedAt).toLocaleString():''}`);
+      html=`<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="shield-check" style="width:14px;height:14px"></i> SSO cookies configured</div><p>${parts.join('<br>')}</p></div>`;
+    }else{
+      html='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> SSO cookies not configured</div><p>No stored cookies. Paste your browser cookies above to enable token auto-renewal.</p></div>';
+    }
+    $('ssoStatus').innerHTML=html;
+    if(window.lucide)lucide.createIcons();
+  }catch(e){$('ssoStatus').innerHTML=`<div class="highlight-box warning">${e.message}</div>`;}
+}
+
+async function saveSSOCookies(){
+  const raw=($('ssoCookiesInput').value||'').trim();
+  if(!raw)return showNotice('Paste cookie JSON first','error');
+  let cookies;
+  try{
+    cookies=JSON.parse(raw);
+    if(!Array.isArray(cookies))cookies=[cookies];
+  }catch(e){return showNotice('Invalid JSON: '+e.message,'error');}
+  if(!cookies.length)return showNotice('No cookies to save','error');
+  const bad=cookies.filter(c=>!c||!c.name||!c.value||!c.domain);
+  if(bad.length)return showNotice(`${bad.length} cookie(s) missing name, value or domain`,'error');
+  try{
+    const d=await api('/api/sso',{method:'POST',body:JSON.stringify({cookies})});
+    showNotice(`Saved: ${d.loginCookies} login · ${d.m365Cookies} m365 cookies`,'success');
+    $('ssoCookiesInput').value='';
+    loadSSOStatus();
+  }catch(e){showNotice(e.message,'error');}
 }
 
 async function saveRotationSettings(){
