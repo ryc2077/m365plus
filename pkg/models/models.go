@@ -13,7 +13,7 @@ import (
 
 // Version is the application version, shared across all binaries.
 // Overridable at build time via ldflags: -X github.com/ryc2077/m365plus/pkg/models.Version=x.y.z
-var Version = "1.3.7"
+var Version = "1.3.8"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID.

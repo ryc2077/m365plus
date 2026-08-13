@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.8] - 2026-08-13
+
+### Added
+- Web admin console: SSO cookies management form on the Accounts page with JSON paste input, status badge and domain-split validation
+- `GET/POST /api/sso` endpoints: cookie status view and save with per-domain routing
+- `auth.SaveSSOCookieBatch` stores login cookies (`login.microsoftonline.com`) in the SSO store and M365 web cookies (`m365.cloud.microsoft`/`microsoft.com`) in the M365 store, both encrypted at rest
+- `auth.SSOStatus` reports cookie counts and capture timestamps without exposing values
+
 ## [1.3.7] - 2026-07-14
 
 ### Added
