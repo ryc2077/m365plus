@@ -27,6 +27,7 @@ ENV CHROME_BIN=/usr/bin/chromium
 WORKDIR /app
 
 COPY --from=builder /build/bin/m365-bridge ./bin/m365-bridge
+COPY web ./web
 
 # Data directory for tokens, cache, setup.json
 RUN mkdir -p data/tokens
