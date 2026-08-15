@@ -66,16 +66,6 @@ func applyTransportAndTLS(outboundConfig map[string]any, query url.Values) {
 		transport := map[string]any{"type": "ws"}
 		if path := query.Get("path"); path != "" {
 			transport["path"] = path
-			if parsedPath, err := url.Parse(path); err == nil {
-				if earlyData := parsedPath.Query().Get("ed"); earlyData != "" {
-					var maxEarlyData int
-					if _, err := fmt.Sscanf(earlyData, "%d", &maxEarlyData); err == nil && maxEarlyData > 0 {
-						transport["path"] = parsedPath.Path
-						transport["max_early_data"] = maxEarlyData
-						transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
-					}
-				}
-			}
 		}
 		if host := query.Get("host"); host != "" {
 			transport["headers"] = map[string]any{"Host": host}
@@ -260,18 +250,25 @@ func openSingBoxStore() *singBoxStore {
 			if !ok || transport["type"] != "ws" {
 				continue
 			}
+			maxEarlyData, hasEarlyData := transport["max_early_data"]
+			if !hasEarlyData {
+				continue
+			}
+			value := fmt.Sprint(maxEarlyData)
+			if value == "" || value == "0" {
+				continue
+			}
 			path, _ := transport["path"].(string)
-			parsedPath, err := url.Parse(path)
-			if err != nil || parsedPath.Query().Get("ed") == "" {
-				continue
+			if path == "" {
+				path = "/"
 			}
-			var maxEarlyData int
-			if _, err := fmt.Sscanf(parsedPath.Query().Get("ed"), "%d", &maxEarlyData); err != nil || maxEarlyData <= 0 {
-				continue
+			separator := "?"
+			if strings.Contains(path, "?") {
+				separator = "&"
 			}
-			transport["path"] = parsedPath.Path
-			transport["max_early_data"] = maxEarlyData
-			transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
+			transport["path"] = path + separator + "ed=" + value
+			delete(transport, "max_early_data")
+			delete(transport, "early_data_header_name")
 			migrated = true
 		}
 		if migrated {

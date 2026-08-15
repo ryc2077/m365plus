@@ -28,11 +28,11 @@ func TestParseVLESSShareLink(t *testing.T) {
 		t.Fatal("UUID not parsed")
 	}
 	transport, ok := node.Outbound["transport"].(map[string]any)
-	if !ok || transport["type"] != "ws" || transport["path"] != "/" {
+	if !ok || transport["type"] != "ws" || transport["path"] != "/?ed=2048" {
 		t.Fatalf("unexpected transport: %#v", transport)
 	}
-	if transport["max_early_data"] != 2048 || transport["early_data_header_name"] != "Sec-WebSocket-Protocol" {
-		t.Fatalf("WebSocket early data was not converted: %#v", transport)
+	if _, exists := transport["max_early_data"]; exists {
+		t.Fatalf("WebSocket path was unexpectedly converted: %#v", transport)
 	}
 }
 

@@ -39,8 +39,12 @@ func newAPIKeyStore(path string) *apiKeyStore {
 func openAPIKeys() *apiKeyStore {
 	p := strings.TrimSpace(os.Getenv("M365_API_KEYS"))
 	if p == "" {
-		h, _ := os.UserHomeDir()
-		p = filepath.Join(h, ".config", "m365-copilot2api", "api-keys.json")
+		if dataDir := strings.TrimSpace(os.Getenv("M365_DATA_DIR")); dataDir != "" {
+			p = filepath.Join(dataDir, "api-keys.json")
+		} else {
+			h, _ := os.UserHomeDir()
+			p = filepath.Join(h, ".config", "m365-copilot2api", "api-keys.json")
+		}
 	}
 	s := newAPIKeyStore(p)
 	b, e := os.ReadFile(p)
@@ -88,16 +92,16 @@ func (s *apiKeyStore) createBound(name, accountID string) (apiKeyRecord, string,
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
-		if err := s.persist.flushNowBlocking(); err != nil {
-			s.mu.Lock()
-			s.Keys = s.Keys[:len(s.Keys)-1]
-			s.mu.Unlock()
-			return apiKeyRecord{}, "", err
-		}
-		r.Hash = ""
-		r.Raw = ""
-		return r, raw, nil
+	if err := s.persist.flushNowBlocking(); err != nil {
+		s.mu.Lock()
+		s.Keys = s.Keys[:len(s.Keys)-1]
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", err
 	}
+	r.Hash = ""
+	r.Raw = ""
+	return r, raw, nil
+}
 func (s *apiKeyStore) list() []apiKeyRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -13,7 +13,7 @@ import (
 
 // Version is the application version, shared across all binaries.
 // Overridable at build time via ldflags: -X github.com/ryc2077/m365plus/pkg/models.Version=x.y.z
-var Version = "1.3.11"
+var Version = "1.3.12"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID.
@@ -61,6 +61,21 @@ var ModelRegistry = map[string]ModelConfig{
 		Tone:     "Gpt_5_6_Reasoning",
 		Override: "",
 		OpenAIID: "gpt-5.6-reasoning",
+	},
+	"gpt5.6-sol": {
+		Tone:     "Gpt_5_6_Reasoning",
+		Override: "",
+		OpenAIID: "gpt-5.6-sol",
+	},
+	"gpt5.6-terra": {
+		Tone:     "Gpt_5_6_Reasoning",
+		Override: "",
+		OpenAIID: "gpt-5.6-terra",
+	},
+	"gpt5.6-luna": {
+		Tone:     "Gpt_5_6_Reasoning",
+		Override: "",
+		OpenAIID: "gpt-5.6-luna",
 	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {

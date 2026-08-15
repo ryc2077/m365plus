@@ -5,6 +5,16 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.12] - 2026-08-15
+
+### Added
+- Expose GPT-5.6 Sol, Terra and Luna through the OpenAI-compatible model catalog
+- Add model routing tests for the GPT-5.6 named variants
+
+### Fixed
+- Persist API Keys inside `M365_DATA_DIR` so Docker container restarts retain them
+- Preserve the original VLESS WebSocket path, including `/?ed=2048`, without converting it to sing-box early-data fields
+
 ## [1.3.11] - 2026-08-15
 
 ### Added
