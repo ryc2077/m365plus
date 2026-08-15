@@ -57,6 +57,7 @@ type runtimeSettings struct {
 	SessionCachePath         string         `json:"sessionCachePath"`
 	OutboundProxy            string         `json:"outboundProxy"`
 	ProxyPool                []string       `json:"proxyPool,omitempty"`
+	ProxyEnabled             *bool          `json:"proxyEnabled,omitempty"`
 	ClientID                 string         `json:"clientId"`
 	Authority                string         `json:"authority"`
 	RedirectURI              string         `json:"redirectUri"`
@@ -92,12 +93,13 @@ func envBool(name string, fallback bool) bool {
 	return fallback
 }
 func defaultRuntimeSettings() runtimeSettings {
+	proxyEnabled := true
 	return runtimeSettings{
 		MaxToolCallsPerTurn: envInt("M365_MAX_TOOL_CALLS_PER_TURN", 32), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 512),
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 128000), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
 		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
-		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
+		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ProxyEnabled: &proxyEnabled, ClientID: os.Getenv("M365_CLIENT_ID"),
 		Authority: os.Getenv("M365_AUTHORITY"), RedirectURI: os.Getenv("M365_REDIRECT_URI"), Scope: os.Getenv("M365_SCOPE"),
 		ModelMappings:            append([]modelMapping(nil), defaultModelMappings...),
 		ToolPlanningMode:         toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),

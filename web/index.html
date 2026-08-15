@@ -647,18 +647,23 @@ if (response.output_text) {
       <section id="page-proxies" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <div><h2 style="font-size:18px;font-weight:700">Proxy pool</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">Configure outbound proxies with http / https / socks5 and automatic failover</p></div>
-          <button class="btn" onclick="proxyCheckAll()"><i data-lucide="activity" style="width:14px;height:14px"></i> Check all</button>
+          <label style="display:inline-flex;align-items:center;gap:8px;margin-right:12px">
+  <input id="proxyEnabled" type="checkbox" onchange="proxyToggle(this.checked)">
+  <span>Use proxy</span>
+  <small id="proxyEnabledState" style="color:var(--muted)">Enabled</small>
+</label>
+<button class="btn" onclick="proxyCheckAll()"><i data-lucide="activity" style="width:14px;height:14px"></i> Check all</button>
         </div>
         <div class="card" style="margin-bottom:16px">
-          <div class="card-head"><span class="card-title">Add proxy</span></div>
+          <div class="card-head"><span class="card-title">Add proxies or nodes</span></div>
           <div class="card-body">
-            <label class="form-label">Proxy URLs (one per line; bulk paste supported)</label>
-            <textarea class="form-input" id="proxyInput" rows="4" placeholder="http://user:pass@host:port&#10;socks5://127.0.0.1:1080&#10;https://proxy.example.com:443"></textarea>
+            <label class="form-label">Proxy or node links</label>
+            <textarea class="form-input" id="proxyInput" rows="7" placeholder="Paste HTTP, HTTPS, SOCKS5, VLESS, VMess, Trojan, Shadowsocks, Hysteria2 or TUIC links, one per line"></textarea>
             <div style="margin-top:12px;display:flex;gap:8px">
-              <button class="btn primary" onclick="proxyAdd()"><i data-lucide="plus" style="width:14px;height:14px"></i> Add</button>
+              <button class="btn primary" onclick="proxyAdd()"><i data-lucide="plus" style="width:14px;height:14px"></i> Import</button>
               <button class="btn" onclick="proxyTest()">Test connectivity</button>
             </div>
-            <p class="form-hint" style="margin-top:8px">Supported formats: <code>http://</code>, <code>https://</code>, and <code>socks5://</code>; usernames and passwords are supported</p>
+            <p class="form-hint" style="margin-top:8px">Links are detected automatically. sing-box nodes use the shared <code>socks5://sing-box:1080</code> proxy entry.</p>
           </div>
         </div>
         <div class="card">
@@ -1348,6 +1353,7 @@ async function loadKeys(){
     const k=d.keys||[];
     $('keyRows').innerHTML=k.length?k.map(x=>`<tr><td><b>${x.name}</b></td><td><code>${x.prefix}</code></td><td style="font-size:12px;color:var(--muted)">${new Date(x.createdAt).toLocaleString()}</td><td>${x.revoked?'<span class="status offline"><i></i>Disabled</span>':'<span class="status online"><i></i>Active</span>'}</td><td style="font-size:12px;color:var(--muted)">${x.lastUsedAt?new Date(x.lastUsedAt).toLocaleString():'-'}</td><td style="text-align:right;white-space:nowrap">
       <button class="btn-sm btn" onclick="openUseKey('${x.id}')">Use key</button>
+      <button class="btn-sm btn" onclick="copyApiKey('${x.id}')">Copy API Key</button>
       <button class="btn-sm btn" onclick="editKey('${x.id}','${x.name.replace(/'/g,"\\'")}')">Edit</button>
       <button class="btn-sm btn ${x.revoked?'success':'danger'}" onclick="toggleKey('${x.id}',${x.revoked})">${x.revoked?'Enable':'Disable'}</button>
       <button class="btn-sm btn danger" onclick="revokeKey('${x.id}')">Delete</button>
@@ -1371,12 +1377,43 @@ async function toggleKey(id,revoked){
 
 function openKeyModal(){$('keyModal').classList.add('open');$('keyResult').style.display='none';$('keyName').value='default';setTimeout(()=>$('keyName').focus(),50);}
 function closeKeyModal(){$('keyModal').classList.remove('open');}
-async function copyKey(){try{await navigator.clipboard.writeText($('keyValue').value);showNotice('Copied','success');}catch(e){}}
+async function copyText(value){
+  if(!value)return false;
+  try{
+    await navigator.clipboard.writeText(value);
+    return true;
+  }catch(e){
+    const input=document.createElement('textarea');
+    input.value=value;
+    input.setAttribute('readonly','');
+    input.style.position='fixed';
+    input.style.opacity='0';
+    document.body.appendChild(input);
+    input.select();
+    const copied=document.execCommand('copy');
+    input.remove();
+    return copied;
+  }
+}
+async function copyKey(){
+  const copied=await copyText($('keyValue').value);
+  showNotice(copied?'API Key copied':'Copy failed',copied?'success':'error');
+}
+async function copyApiKey(id){
+  const value=$('keyValue').value;
+  const recordId=$('keyValue').dataset.keyId;
+  if(!value||recordId!==id){
+    showNotice('Full API Key is only available immediately after creation','error');
+    return;
+  }
+  const copied=await copyText(value);
+  showNotice(copied?'API Key copied':'Copy failed',copied?'success':'error');
+}
 async function createKey(e){
   e.preventDefault();
   try{
     const d=await api('/api/admin/keys',{method:'POST',body:JSON.stringify({name:$('keyName').value||'default'})});
-    $('keyValue').value=d.key;$('keyResult').style.display='block';copyKey();loadKeys();
+    $('keyValue').value=d.key;$('keyValue').dataset.keyId=d.record.id;$('keyResult').style.display='block';copyKey();loadKeys();
   }catch(e){showNotice(e.message,'error');}
 }
 async function revokeKey(id){if(!confirm('Delete this key?'))return;try{await api('/api/admin/keys?id='+id,{method:'DELETE'});loadKeys();}catch(e){showNotice(e.message,'error');}}
@@ -1671,19 +1708,85 @@ function proxyRow(x){
     </td>
   </tr>`;
 }
+const singBoxDelays={};
+function singBoxProxyRow(node){
+  const delay=singBoxDelays[node.id];
+  return `<tr>
+    <td><code style="font-size:12px">${esc(node.protocol+'://'+node.name)}</code><div style="font-size:11px;color:var(--muted)">via socks5://sing-box:1080${node.active?' · Active':''}</div></td>
+    <td><span class="status ${node.active?'online':''}"><i></i>${node.active?'Active':'Available'}</span></td>
+    <td style="font-size:12px;color:var(--muted)">${delay===-1?'<span style="color:var(--danger)">Unreachable</span>':delay?delay+' ms':'-'}</td>
+    <td style="font-size:12px;color:var(--muted)">-</td>
+    <td style="font-size:12px;color:var(--muted)">-</td>
+    <td style="text-align:right;white-space:nowrap">
+      <button class="btn-sm btn" onclick="singBoxCheck('${node.id}')">Latency</button>
+      <button class="btn-sm btn ${node.active?'success':''}" onclick="singBoxSwitch('${node.id}')" ${node.active?'disabled':''}>${node.active?'Selected':'Switch'}</button>
+      <button class="btn-sm btn danger" onclick="singBoxRemove('${node.id}')">Delete</button>
+    </td>
+  </tr>`;
+}
+async function singBoxCheck(id){
+  try{
+    const result=await api('/api/admin/sing-box/nodes?action=check&id='+encodeURIComponent(id),{method:'PUT'});
+    singBoxDelays[id]=result.reachable?result.delayMs:-1;
+    showNotice(result.reachable?'Latency: '+result.delayMs+' ms':'Node unreachable',result.reachable?'success':'error');
+    loadProxies();
+  }catch(e){showNotice(e.message,'error');}
+}
+async function singBoxSwitch(id){
+  try{
+    await api('/api/admin/sing-box/nodes?action=switch&id='+encodeURIComponent(id),{method:'PUT'});
+    showNotice('Node switched','success');
+    loadProxies();
+  }catch(e){showNotice(e.message,'error');}
+}
 async function loadProxies(){
   try{
     const d=await api('/api/admin/proxy-pool');
-    const p=d.proxies||[];
-    $('proxyRows').innerHTML=p.length?p.map(proxyRow).join(''):'<tr><td colspan="6" class="empty">No proxies; requests will connect directly</td></tr>';
+    const toggle=$('proxyEnabled');
+    if(toggle)toggle.checked=d.enabled!==false;
+    const state=$('proxyEnabledState');
+    if(state)state.textContent=d.enabled===false?'Disabled · direct connection':'Enabled';
+    const p=(d.proxies||[]).filter(item=>item.url!=='socks5://sing-box:1080');
+    const nodes=d.singBoxNodes||[];
+    const rows=p.map(proxyRow).concat(nodes.map(singBoxProxyRow));
+    $('proxyRows').innerHTML=rows.length?rows.join(''):'<tr><td colspan="6" class="empty">No proxies; requests will connect directly</td></tr>';
   }catch(e){$('proxyRows').innerHTML=`<tr><td colspan="6" class="empty">${e.message}</td></tr>`;}
+}
+async function proxyToggle(enabled){
+  try{
+    await api('/api/admin/proxy-pool?action=toggle',{method:'PUT',body:JSON.stringify({enabled})});
+    showNotice(enabled?'Proxy enabled':'Proxy disabled; using direct connection','success');
+    loadProxies();
+  }catch(e){
+    const toggle=$('proxyEnabled');
+    if(toggle)toggle.checked=!enabled;
+    showNotice(e.message,'error');
+  }
+}
+function singBoxNodeRow(node){
+  return `<tr><td><b>${esc(node.name)}</b></td><td><code>${esc(node.protocol)}</code></td><td><span class="status ${node.enabled?'online':'offline'}"><i></i>${node.enabled?'Enabled':'Disabled'}</span></td><td style="text-align:right"><button class="btn-sm btn danger" onclick="singBoxRemove('${node.id}')">Delete</button></td></tr>`;
+}
+async function loadSingBoxNodes(){
+  try{
+    const data=await api('/api/admin/sing-box/nodes');
+    const nodes=data.nodes||[];
+    $('singBoxRows').innerHTML=nodes.length?nodes.map(singBoxNodeRow).join(''):'<tr><td colspan="4" class="empty">No sing-box nodes</td></tr>';
+  }catch(e){$('singBoxRows').innerHTML=`<tr><td colspan="4" class="empty">${esc(e.message)}</td></tr>`;}
+}
+async function singBoxRemove(id){
+  if(!confirm('Delete this sing-box node?'))return;
+  try{const result=await api('/api/admin/sing-box/nodes?id='+encodeURIComponent(id),{method:'DELETE'});showNotice(result.restartRequired?'Node deleted; restart sing-box to apply':'Node deleted','success');loadSingBoxNodes();loadProxies();}
+  catch(e){showNotice(e.message,'error');}
 }
 async function proxyAdd(){
   const raw=$('proxyInput').value.trim();
   if(!raw)return showNotice('Enter a proxy URL','error');
   try{
     const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw]})});
-    showNotice('Added '+d.added+' proxies','success');$('proxyInput').value='';loadProxies();
+    const parts=[];
+    if(d.directAdded)parts.push(d.directAdded+' direct');
+    if(d.singBoxAdded)parts.push(d.singBoxAdded+' sing-box');
+    showNotice('Imported '+d.added+' item'+(d.added===1?'':'s')+(parts.length?' ('+parts.join(', ')+')':''),'success');$('proxyInput').value='';loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
 async function proxyRemove(url){

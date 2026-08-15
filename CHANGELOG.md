@@ -5,6 +5,20 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.11] - 2026-08-15
+
+### Added
+- Unified proxy import for HTTP, HTTPS, SOCKS5, VLESS, VMess, Trojan, Shadowsocks, Hysteria2 and TUIC links
+- sing-box node management in the proxy pool, including latency testing and active-node switching
+- Persistent proxy master switch that immediately changes between proxy routing and direct connections
+- API key copy controls in the web administration interface
+
+### Fixed
+- Convert VLESS WebSocket `ed` query parameters to sing-box early-data settings
+- Roll back the selected sing-box node when a runtime switch fails
+- Avoid duplicate display of the internal sing-box SOCKS5 bridge
+- Include the web interface assets in Docker images
+
 
 ## [1.3.9] - 2026-08-13
 

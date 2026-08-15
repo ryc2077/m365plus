@@ -1,12 +1,24 @@
 services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: m365plus-sing-box
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - /Users/a1-6/m365bridge/data/sing-box:/etc/sing-box:ro
+    restart: unless-stopped
+
   m365bridge:
     build: .
-    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    image: m365plus:local
     container_name: m365bridge
+    depends_on:
+      - sing-box
     ports:
-      - "8230:8000"
+      - "8234:8000"
     volumes:
-      - ./data:/app/data
+      - /Users/a1-6/m365bridge/data:/app/data
     environment:
       - M365_DATA_DIR=/app/data
+      - M365_TENANT_ID=5a506de4-b69f-4a54-b154-a07fc16c842e
+      - M365_USER_OID=126a89dd-7536-4344-a045-2c037c63e31b
     restart: unless-stopped

@@ -51,6 +51,7 @@ type Server struct {
 	chatFunc            ChatFunc
 	dataPlane           http.Handler
 	debug               *debugStore
+	singBox             *singBoxStore
 	rotationMu          sync.Mutex
 	rotationID          string
 	rotationCount       int
@@ -94,6 +95,10 @@ func New() (*Server, error) {
 		settings:            openSettingsStore(),
 		usage:               openUsageLog(),
 		debug:               openDebugStore(),
+		singBox:             openSingBoxStore(),
+	}
+	if len(s.singBox.Nodes) > 0 {
+		_ = s.singBox.save()
 	}
 	s.applyTokenRefreshInterval()
 	return s, nil
@@ -228,6 +233,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/chat", s.adminChat)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
 	m.HandleFunc("/api/admin/proxy-pool", s.proxyPool)
+	m.HandleFunc("/api/admin/sing-box/nodes", s.singBoxNodes)
 	m.HandleFunc("/api/admin/deployments", s.deployments)
 	m.HandleFunc("/api/admin/deployment", s.deploymentAction)
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
