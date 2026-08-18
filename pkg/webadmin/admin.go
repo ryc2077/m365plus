@@ -171,6 +171,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list := s.tokens.List()
+	autoRotate := s.settings != nil && s.settings.get().AutoRotateAccounts
 	s.rotationMu.Lock()
 	activeID := s.rotationID
 	s.rotationMu.Unlock()
@@ -192,7 +193,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
-			Active: a.ID == activeID,
+			Active: autoRotate && a.ID == activeID,
 			SSO:    ssoStatusFor(a.ID),
 		})
 	}
@@ -500,8 +501,12 @@ func (s *Server) nextRotationAccount() (accounts.AccountToken, error) {
 				if !s.accountPool.Available(acc.ID) {
 					continue
 				}
+				previousID := s.rotationID
 				s.rotationID = acc.ID
 				s.rotationCount = 1
+				if previousID != acc.ID {
+					log.Printf("[account-rotation] switched account from=%s to=%s email=%s reason=request_limit max_requests=%d", previousID, acc.ID, acc.Email, maxReq)
+				}
 				return s.tokens.EnsureValid(acc.ID)
 			}
 			return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
@@ -518,6 +523,12 @@ func (s *Server) nextRotationAccount() (accounts.AccountToken, error) {
 		}
 		if !s.accountPool.Available(acc.ID) {
 			return accounts.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
+		}
+		previousID := s.rotationID
+		s.rotationID = acc.ID
+		s.rotationCount = 1
+		if previousID != acc.ID {
+			log.Printf("[account-rotation] switched account from=%s to=%s email=%s reason=round_robin max_requests=0", previousID, acc.ID, acc.Email)
 		}
 		return s.tokens.EnsureValid(acc.ID)
 	}

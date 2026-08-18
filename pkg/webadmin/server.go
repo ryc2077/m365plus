@@ -14,6 +14,7 @@ import (
 
 	"github.com/ryc2077/m365plus/pkg/accounts"
 	"github.com/ryc2077/m365plus/pkg/logging"
+	"github.com/ryc2077/m365plus/pkg/servers"
 )
 
 // pendingPKCE tracks an in-progress PKCE authorization.
@@ -158,6 +159,22 @@ func (s *Server) Settings() *settingsStore { return s.settings }
 
 // Usage returns the usage logger so the data plane can record every request.
 func (s *Server) Usage() *usageLog { return s.usage }
+
+func (s *Server) RecordUsage(rec servers.UsageRecord) {
+	s.usage.record(UsageRecord{
+		Time:         rec.Time,
+		APIKeyPrefix: rec.APIKeyPrefix,
+		AccountEmail: rec.AccountEmail,
+		Model:        rec.Model,
+		Endpoint:     rec.Endpoint,
+		Stream:       rec.Stream,
+		InputTokens:  rec.InputTokens,
+		OutputTokens: rec.OutputTokens,
+		CacheTokens:  rec.CacheTokens,
+		DurationMs:   rec.DurationMs,
+		Status:       rec.Status,
+	})
+}
 
 // SetModelTester registers the data-plane probe hook used by adminModelTest.
 func (s *Server) SetModelTester(t ModelTester) {

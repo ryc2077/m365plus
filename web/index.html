@@ -1181,7 +1181,7 @@ async function loadRecentRequests(){
   }catch(e){$('dashRecentRows').innerHTML=`<tr><td colspan="5" class="empty">No requests yet</td></tr>`;}
 }
 
-let _accountsCache=[],_accountFilter='all';
+let _accountsCache=[],_accountFilter='all',_autoRotateAccounts=false;
 function setAccountFilter(f){_accountFilter=f;document.querySelectorAll('#accountFilter button').forEach(b=>b.classList.toggle('active',b.dataset.f===f));renderAccounts();}
 function renderAccounts(){
   const q=($('accountSearch').value||'').trim().toLowerCase();
@@ -1191,19 +1191,20 @@ function renderAccounts(){
     if(q&&!((x.displayName||'')+' '+(x.email||'')).toLowerCase().includes(q))return false;
     return true;
   });
-  $('accountRows').innerHTML=list.length?list.map(x=>`<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}${x.active?' <span class="status online" style="font-size:10px"><i></i>Current</span>':''}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td><span class="status ${x.status==='online'?'online':'offline'}"><i></i>${x.status==='online'?'Online':'Offline'}</span></td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><div style="display:flex;gap:6px;align-items:center"><button class="btn-sm btn" onclick="openAccountSSO('${x.id}')" title="SSO cookies"><i data-lucide="cookie" style="width:13px;height:13px"></i> SSO${(x.sso&&x.sso.loginCookies>0)?` <span class="sso-dot" title="${x.sso.loginCookies} login · ${x.sso.m365Cookies||0} m365 cookie(s)"></span>`:''}</button><button class="btn-sm btn" onclick="switchAccount('${x.id}')" ${x.active?'disabled':''}>${x.active?'Current':'Switch'}</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></div></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No matching accounts</td></tr>';
+  $('accountRows').innerHTML=list.length?list.map(x=>`<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}${_autoRotateAccounts&&x.active?' <span class="status online" style="font-size:10px"><i></i>当前轮换</span>':''}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td><span class="status ${x.status==='online'?'online':'offline'}"><i></i>${x.status==='online'?'Online':'Offline'}</span></td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><div style="display:flex;gap:6px;align-items:center"><button class="btn-sm btn" onclick="openAccountSSO('${x.id}')" title="SSO cookies"><i data-lucide="cookie" style="width:13px;height:13px"></i> SSO${(x.sso&&x.sso.loginCookies>0)?` <span class="sso-dot" title="${x.sso.loginCookies} login · ${x.sso.m365Cookies||0} m365 cookie(s)"></span>`:''}</button><button class="btn-sm btn" onclick="switchAccount('${x.id}')" ${x.active?'disabled':''}>${x.active?'Current':'Switch'}</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></div></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
   try{
     const [d,s]=await Promise.all([api('/api/accounts'),api('/api/admin/settings')]);
     _accountsCache=d.accounts||[];
-    renderAccounts();
     if(s&&s.settings){
       $('maxReqPerAccount').value=s.settings.maxRequestsPerAccount??'';
       $('tokenRefreshInterval').value=s.settings.tokenRefreshIntervalMins??'';
       $('autoRotateAccounts').checked=!!s.settings.autoRotateAccounts;
+      _autoRotateAccounts=!!s.settings.autoRotateAccounts;
       $('incrementalContext').checked=!!s.settings.incrementalContext;
     }
+    renderAccounts();
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
   loadSSOStatus();
 }

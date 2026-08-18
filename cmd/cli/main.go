@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ryc2077/m365plus/pkg/auth"
 	"github.com/ryc2077/m365plus/pkg/accounts"
+	"github.com/ryc2077/m365plus/pkg/auth"
 	"github.com/ryc2077/m365plus/pkg/logging"
 	"github.com/ryc2077/m365plus/pkg/models"
 	"github.com/ryc2077/m365plus/pkg/payload"
@@ -99,6 +99,7 @@ func runServer(args []string) {
 
 	apiServer := servers.NewAPIServer(config, tokenManager)
 	apiServer.SetAccountResolver(admin)
+	apiServer.SetUsageRecorder(admin)
 	admin.SetDataPlane(apiServer.Handler())
 	admin.SetModelTester(func(ctx context.Context, acc accounts.AccountToken, model string) (string, error) {
 		return probeModel(ctx, apiServer, acc, model)

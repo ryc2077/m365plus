@@ -1,9 +1,12 @@
 package webadmin
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,6 +68,44 @@ func TestNextRotationAccountCycles(t *testing.T) {
 	for i := range want {
 		if seen[i] != want[i] {
 			t.Fatalf("iter %d: got %s want %s (full %v)", i, seen[i], want[i], seen)
+		}
+	}
+}
+
+func TestNextRotationAccountLogsSwitch(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{tokens: seedStoreN(t, dir, 2), accountPool: newAccountHealth()}
+	s.settings = openSettingsStore()
+	cfg := s.settings.get()
+	cfg.MaxRequestsPerAccount = 1
+	cfg.AutoRotateAccounts = true
+	if err := s.settings.save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	if _, err := s.nextRotationAccount(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.nextRotationAccount(); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := output.String()
+	for _, expected := range []string{
+		"[account-rotation] switched account",
+		"from=oid-a",
+		"to=oid-b",
+		"email=userb@example.com",
+		"reason=request_limit",
+		"max_requests=1",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("rotation log %q does not contain %q", logs, expected)
 		}
 	}
 }

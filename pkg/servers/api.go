@@ -3,6 +3,7 @@
 package servers
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
@@ -204,6 +205,62 @@ type APIServer struct {
 	stopCh          chan struct{}
 	mu              sync.RWMutex
 	accountResolver AccountResolver
+	usageRecorder   UsageRecorder
+}
+
+type UsageRecord struct {
+	Time         time.Time
+	APIKeyPrefix string
+	AccountEmail string
+	Model        string
+	Endpoint     string
+	Stream       bool
+	InputTokens  int64
+	OutputTokens int64
+	CacheTokens  int64
+	DurationMs   int64
+	Status       int
+}
+
+type UsageRecorder interface {
+	RecordUsage(UsageRecord)
+}
+
+type usageResponseWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *usageResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *usageResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if w.body.Len() < 4<<20 {
+		remaining := 4<<20 - w.body.Len()
+		if len(data) > remaining {
+			w.body.Write(data[:remaining])
+		} else {
+			w.body.Write(data)
+		}
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *usageResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // NewAPIServer creates a new API server instance.
@@ -220,6 +277,12 @@ func NewAPIServer(config *models.Config, tokenManager *auth.TokenManager) *APISe
 func (api *APIServer) SetAccountResolver(r AccountResolver) {
 	api.mu.Lock()
 	api.accountResolver = r
+	api.mu.Unlock()
+}
+
+func (api *APIServer) SetUsageRecorder(recorder UsageRecorder) {
+	api.mu.Lock()
+	api.usageRecorder = recorder
 	api.mu.Unlock()
 }
 
@@ -381,7 +444,49 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if ra != nil {
 			r = withReqAccount(r, ra)
 		}
-		next(w, r)
+		api.mu.RLock()
+		recorder := api.usageRecorder
+		api.mu.RUnlock()
+		if recorder == nil {
+			next(w, r)
+			return
+		}
+
+		requestBody, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(requestBody))
+		var metadata struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		_ = json.Unmarshal(requestBody, &metadata)
+
+		start := time.Now()
+		capture := &usageResponseWriter{ResponseWriter: w}
+		next(capture, r)
+		status := capture.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		apiKey := api.extractAPIKey(r)
+		if len(apiKey) > 8 {
+			apiKey = apiKey[:8]
+		}
+		accountEmail := ""
+		if ra != nil {
+			accountEmail = ra.token.Email
+		}
+		recorder.RecordUsage(UsageRecord{
+			Time:         start,
+			APIKeyPrefix: apiKey,
+			AccountEmail: accountEmail,
+			Model:        metadata.Model,
+			Endpoint:     r.URL.Path,
+			Stream:       metadata.Stream,
+			InputTokens:  int64(countTokens(string(requestBody))),
+			OutputTokens: int64(countTokens(capture.body.String())),
+			DurationMs:   time.Since(start).Milliseconds(),
+			Status:       status,
+		})
 	}
 }
 
