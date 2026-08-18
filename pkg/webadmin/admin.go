@@ -205,10 +205,10 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 type ssoView struct {
 	LoginAvailable bool      `json:"loginAvailable"`
 	LoginCookies   int       `json:"loginCookies"`
-	LoginCaptured  time.Time `json:"loginCapturedAt,omitempty"`
+	LoginCaptured  time.Time `json:"loginCapturedAt"`
 	M365Available  bool      `json:"m365Available"`
 	M365Cookies    int       `json:"m365Cookies"`
-	M365Captured   time.Time `json:"m365CapturedAt,omitempty"`
+	M365Captured   time.Time `json:"m365CapturedAt"`
 }
 
 func ssoStatusFor(accountID string) ssoView {

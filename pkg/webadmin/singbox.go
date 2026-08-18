@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -303,9 +305,7 @@ func (s *singBoxStore) writeConfigLocked() error {
 			continue
 		}
 		outboundConfig := make(map[string]any, len(node.Outbound)+2)
-		for key, value := range node.Outbound {
-			outboundConfig[key] = value
-		}
+		maps.Copy(outboundConfig, node.Outbound)
 		outboundConfig["type"] = node.Protocol
 		outboundConfig["tag"] = node.ID
 		outbounds = append(outbounds, outboundConfig)
@@ -317,13 +317,7 @@ func (s *singBoxStore) writeConfigLocked() error {
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 	final := "direct"
 	if len(nodeIDs) > 0 {
-		validSelected := false
-		for _, id := range nodeIDs {
-			if id == selected {
-				validSelected = true
-				break
-			}
-		}
+		validSelected := slices.Contains(nodeIDs, selected)
 		if !validSelected {
 			selected = nodeIDs[0]
 		}
