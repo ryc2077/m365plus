@@ -1,0 +1,23 @@
+[Unit]
+Description=M365Plus API Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m365plus
+Group=m365plus
+WorkingDirectory=/opt/m365plus
+EnvironmentFile=-/etc/m365plus/m365plus.env
+ExecStart=/opt/m365plus/bin/m365plus-entrypoint serve --port 8234
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/m365plus
+
+[Install]
+WantedBy=multi-user.target

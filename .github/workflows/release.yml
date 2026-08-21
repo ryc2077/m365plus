@@ -34,6 +34,27 @@ jobs:
             GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build -ldflags "-X github.com/ryc2077/m365plus/pkg/models.Version=${{ github.ref_name }}" -o "dist/${BINARY_NAME}" ./cmd/cli
           done
           ls -la dist/
+
+      - name: Build LXC packages
+        run: |
+          set -euo pipefail
+          SINGBOX_IMAGE=ghcr.io/sagernet/sing-box:latest
+          for ARCH in amd64 arm64; do
+            ROOT="dist/lxc-${ARCH}/m365plus"
+            mkdir -p "${ROOT}/bin" "${ROOT}/web"
+            cp "dist/m365-bridge-linux-${ARCH}" "${ROOT}/bin/m365-bridge"
+            cp -R web/. "${ROOT}/web/"
+            cp packaging/lxc/m365plus.service "${ROOT}/m365plus.service"
+            cp packaging/lxc/m365plus.env "${ROOT}/m365plus.env"
+            cp packaging/lxc/m365plus-entrypoint "${ROOT}/bin/m365plus-entrypoint"
+            chmod +x "${ROOT}/bin/m365-bridge" "${ROOT}/bin/m365plus-entrypoint"
+            docker pull --platform "linux/${ARCH}" "${SINGBOX_IMAGE}"
+            CONTAINER=$(docker create --platform "linux/${ARCH}" "${SINGBOX_IMAGE}")
+            docker cp "${CONTAINER}:/usr/local/bin/sing-box" "${ROOT}/bin/sing-box"
+            docker rm "${CONTAINER}"
+            chmod +x "${ROOT}/bin/sing-box"
+            tar -C "dist/lxc-${ARCH}" -czf "dist/m365plus-lxc-linux-${ARCH}.tar.gz" m365plus
+          done
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 

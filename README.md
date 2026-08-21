@@ -327,3 +327,12 @@ data/                    # 运行时数据（gitignored）：tokens/、setup.jso
 ## 许可证
 
 Research Only
+# Non-Docker LXC installation
+
+Debian and Ubuntu LXC containers can run M365Plus directly with systemd. The release package includes M365Plus, the web interface, and sing-box for both amd64 and arm64.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ryc2077/m365plus/master/scripts/install-lxc.sh | sudo sh
+```
+
+The service listens on port `8234`. Persistent data is stored in `/var/lib/m365plus`, configuration in `/etc/m365plus/m365plus.env`, and logs are available through `journalctl -u m365plus -f`. Run the same installer again to upgrade while preserving data.
