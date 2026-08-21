@@ -220,7 +220,7 @@ func parseSingBoxShareLink(raw string) (singBoxNode, error) {
 	}
 }
 
-const singBoxProxyURL = "socks5://sing-box:1080"
+const singBoxProxyURL = "socks5://127.0.0.1:1080"
 
 type singBoxNode struct {
 	ID       string         `json:"id"`

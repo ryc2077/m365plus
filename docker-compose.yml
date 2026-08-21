@@ -1,20 +1,8 @@
 services:
-  sing-box:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: m365plus-sing-box
-    command: ["run", "-c", "/etc/sing-box/config.json"]
-    volumes:
-      - /Users/a1-6/m365bridge/data/sing-box:/etc/sing-box:ro
-    environment:
-      - TZ=Asia/Shanghai
-    restart: unless-stopped
-
   m365bridge:
     build: .
     image: m365plus:local
     container_name: m365bridge
-    depends_on:
-      - sing-box
     ports:
       - "8234:8000"
     volumes:

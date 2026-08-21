@@ -663,7 +663,7 @@ if (response.output_text) {
               <button class="btn primary" onclick="proxyAdd()"><i data-lucide="plus" style="width:14px;height:14px"></i> Import</button>
               <button class="btn" onclick="proxyTest()">Test connectivity</button>
             </div>
-            <p class="form-hint" style="margin-top:8px">Links are detected automatically. sing-box nodes use the shared <code>socks5://sing-box:1080</code> proxy entry.</p>
+            <p class="form-hint" style="margin-top:8px">Links are detected automatically. sing-box is included in this image and uses the internal <code>socks5://127.0.0.1:1080</code> proxy entry.</p>
           </div>
         </div>
         <div class="card">
@@ -1713,7 +1713,7 @@ const singBoxDelays={};
 function singBoxProxyRow(node){
   const delay=singBoxDelays[node.id];
   return `<tr>
-    <td><code style="font-size:12px">${esc(node.protocol+'://'+node.name)}</code><div style="font-size:11px;color:var(--muted)">via socks5://sing-box:1080${node.active?' · Active':''}</div></td>
+    <td><code style="font-size:12px">${esc(node.protocol+'://'+node.name)}</code><div style="font-size:11px;color:var(--muted)">via embedded sing-box${node.active?' · Active':''}</div></td>
     <td><span class="status ${node.active?'online':''}"><i></i>${node.active?'Active':'Available'}</span></td>
     <td style="font-size:12px;color:var(--muted)">${delay===-1?'<span style="color:var(--danger)">Unreachable</span>':delay?delay+' ms':'-'}</td>
     <td style="font-size:12px;color:var(--muted)">-</td>
@@ -1747,7 +1747,7 @@ async function loadProxies(){
     if(toggle)toggle.checked=d.enabled!==false;
     const state=$('proxyEnabledState');
     if(state)state.textContent=d.enabled===false?'Disabled · direct connection':'Enabled';
-    const p=(d.proxies||[]).filter(item=>item.url!=='socks5://sing-box:1080');
+    const p=(d.proxies||[]).filter(item=>item.url!=='socks5://127.0.0.1:1080'&&item.url!=='socks5://sing-box:1080');
     const nodes=d.singBoxNodes||[];
     const rows=p.map(proxyRow).concat(nodes.map(singBoxProxyRow));
     $('proxyRows').innerHTML=rows.length?rows.join(''):'<tr><td colspan="6" class="empty">No proxies; requests will connect directly</td></tr>';

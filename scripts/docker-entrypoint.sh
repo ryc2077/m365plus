@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+CONFIG_PATH=${M365_SINGBOX_CONFIG:-/app/data/sing-box/config.json}
+CHECK_INTERVAL=${M365_SINGBOX_CHECK_INTERVAL:-2}
+
+singbox_pid=
+config_signature=
+
+stop_singbox() {
+  if [ -n "${singbox_pid}" ] && kill -0 "${singbox_pid}" 2>/dev/null; then
+    kill "${singbox_pid}" 2>/dev/null || true
+    wait "${singbox_pid}" 2>/dev/null || true
+  fi
+  singbox_pid=
+}
+
+start_singbox() {
+  [ -s "${CONFIG_PATH}" ] || return 0
+  if ! sing-box check -c "${CONFIG_PATH}"; then
+    echo "[sing-box] configuration check failed: ${CONFIG_PATH}" >&2
+    return 0
+  fi
+  echo "[sing-box] starting embedded runtime with ${CONFIG_PATH}"
+  sing-box run -c "${CONFIG_PATH}" &
+  singbox_pid=$!
+}
+
+watch_singbox() {
+  while kill -0 "${app_pid}" 2>/dev/null; do
+    if [ -s "${CONFIG_PATH}" ]; then
+      new_signature=$(cksum "${CONFIG_PATH}" | awk '{print $1 ":" $2}')
+      if [ "${new_signature}" != "${config_signature}" ]; then
+        stop_singbox
+        config_signature=${new_signature}
+        start_singbox
+      elif [ -n "${singbox_pid}" ] && ! kill -0 "${singbox_pid}" 2>/dev/null; then
+        echo "[sing-box] process exited; restarting" >&2
+        start_singbox
+      fi
+    fi
+    sleep "${CHECK_INTERVAL}"
+  done
+}
+
+shutdown() {
+  stop_singbox
+  if [ -n "${app_pid:-}" ] && kill -0 "${app_pid}" 2>/dev/null; then
+    kill "${app_pid}" 2>/dev/null || true
+  fi
+}
+trap shutdown INT TERM EXIT
+
+/app/bin/m365-bridge "$@" &
+app_pid=$!
+watch_singbox &
+watcher_pid=$!
+wait "${app_pid}"
+app_status=$?
+kill "${watcher_pid}" 2>/dev/null || true
+wait "${watcher_pid}" 2>/dev/null || true
+exit "${app_status}"
