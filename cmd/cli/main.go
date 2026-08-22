@@ -112,8 +112,10 @@ func runServer(args []string) {
 	apiServer.StartBackgroundTasks()
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", *port),
-		Handler: handler,
+		Addr:              fmt.Sprintf(":%d", *port),
+		Handler:           handler,
+		ReadHeaderTimeout: 20 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	sigChan := make(chan os.Signal, 1)

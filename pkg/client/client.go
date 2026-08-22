@@ -9,18 +9,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/ryc2077/m365plus/pkg/auth"
 	"github.com/ryc2077/m365plus/pkg/logging"
 	"github.com/ryc2077/m365plus/pkg/models"
 	"github.com/ryc2077/m365plus/pkg/payload"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -217,10 +219,15 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 		HandshakeTimeout: c.handshakeTimeout,
 	}
 
-	conn, _, err := dialer.Dial(url, nil)
+	conn, dialResponse, err := dialer.Dial(url, nil)
 	if err != nil {
-		logging.Errorf("dialConnection: WebSocket dial failed: %v", err)
-		return nil, "", "", fmt.Errorf("failed to dial: %w", err)
+		status := 0
+		if dialResponse != nil {
+			status = dialResponse.StatusCode
+			_ = dialResponse.Body.Close()
+		}
+		logging.Errorf("dialConnection: WebSocket dial failed: status=%d err=%v", status, err)
+		return nil, "", "", &UpstreamError{Op: "dial", Status: status, Err: err}
 	}
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(handshakeMessage)); err != nil {
@@ -284,9 +291,70 @@ type StreamChunk struct {
 	Thinking       string
 	IsFinal        bool
 	Error          error
-	ConversationID string     // set on final chunk
-	ToolCalls      []ToolCall // set on final chunk
-	FinishReason   string     // set on final chunk
+	ConversationID string          // set on final chunk
+	ToolCalls      []ToolCall      // set on final chunk
+	FinishReason   string          // set on final chunk
+	Throttling     *ThrottlingInfo // latest quota counters
+}
+
+type ThrottlingInfo struct {
+	NumUserMessages    *int
+	MaxNumUserMessages *int
+	Extra              map[string]any
+}
+
+func (t *ThrottlingInfo) Exhausted() bool {
+	return t != nil && t.NumUserMessages != nil && t.MaxNumUserMessages != nil &&
+		*t.MaxNumUserMessages > 0 && *t.NumUserMessages >= *t.MaxNumUserMessages
+}
+
+func (t *ThrottlingInfo) Summary() string {
+	if t == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3+len(t.Extra))
+	if t.NumUserMessages != nil {
+		parts = append(parts, fmt.Sprintf("used=%d", *t.NumUserMessages))
+	}
+	if t.MaxNumUserMessages != nil {
+		parts = append(parts, fmt.Sprintf("max=%d", *t.MaxNumUserMessages))
+	}
+	if t.NumUserMessages != nil && t.MaxNumUserMessages != nil {
+		parts = append(parts, fmt.Sprintf("headroom=%d", *t.MaxNumUserMessages-*t.NumUserMessages))
+	}
+	for _, key := range slices.Sorted(maps.Keys(t.Extra)) {
+		parts = append(parts, fmt.Sprintf("%s=%v", key, t.Extra[key]))
+	}
+	return strings.Join(parts, " ")
+}
+
+func parseThrottling(raw map[string]any) *ThrottlingInfo {
+	if len(raw) == 0 {
+		return nil
+	}
+	info := &ThrottlingInfo{}
+	for key, value := range raw {
+		number, numeric := value.(float64)
+		switch key {
+		case "numUserMessagesInConversation":
+			if numeric {
+				n := int(number)
+				info.NumUserMessages = &n
+				continue
+			}
+		case "maxNumUserMessagesInConversation":
+			if numeric {
+				n := int(number)
+				info.MaxNumUserMessages = &n
+				continue
+			}
+		}
+		if info.Extra == nil {
+			info.Extra = make(map[string]any)
+		}
+		info.Extra[key] = value
+	}
+	return info
 }
 
 // ChatStreamGen generates a stream of response chunks for a single text prompt.
@@ -457,7 +525,9 @@ func (c *M365Client) ChatConversationStreamGenContext(
 		seenImages := map[string]bool{}
 		accText := ""
 		accThinking := ""
+		var citations citationFilter
 		var finalConvID string
+		var throttling *ThrottlingInfo
 
 		for {
 			conn.SetReadDeadline(time.Now().Add(c.recvFinalTimeout))
@@ -518,6 +588,9 @@ func (c *M365Client) ChatConversationStreamGenContext(
 									if th, ok := argMap["throttling"]; ok {
 										j, _ := json.Marshal(th)
 										logging.Debugf("ConvStream throttling: %s", string(j))
+										if raw, ok := th.(map[string]any); ok {
+											throttling = parseThrottling(raw)
+										}
 									}
 									// DEBUG: log all keys in argMap
 									logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
@@ -577,18 +650,14 @@ func (c *M365Client) ChatConversationStreamGenContext(
 												}
 											}
 										}
-										// Only process text from the last message (skip Progress messages)
+										// Only process answer text from the last message. Progress and
+										// backend tool messages are not part of the assistant reply.
 										if len(msgs) > 0 {
 											if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok {
-												if lastMsgType, _ := lastMsg["messageType"].(string); lastMsgType != "Progress" {
+												if carriesAnswerText(lastMsg) {
 													if newText, ok := lastMsg["text"].(string); ok && newText != "" {
-														if newText != accText {
-															var chunk string
-															if strings.HasPrefix(newText, accText) {
-																chunk = newText[len(accText):]
-															} else {
-																chunk = newText
-															}
+														newText = stripCitations(newText)
+														if chunk, advanced := snapshotDelta(accText, newText); advanced {
 															accText = newText
 															if chunk != "" {
 																if !emit(StreamChunk{Text: chunk, IsFinal: false}) {
@@ -602,9 +671,11 @@ func (c *M365Client) ChatConversationStreamGenContext(
 										}
 									}
 									if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok {
-										accText += writeAtCursor
-										if !emit(StreamChunk{Text: writeAtCursor, IsFinal: false}) {
-											return
+										if emitText := citations.push(writeAtCursor); emitText != "" {
+											accText += emitText
+											if !emit(StreamChunk{Text: emitText, IsFinal: false}) {
+												return
+											}
 										}
 									}
 								}
@@ -617,14 +688,25 @@ func (c *M365Client) ChatConversationStreamGenContext(
 						if convID, ok := item["conversationId"].(string); ok && convID != "" {
 							finalConvID = convID
 						}
+						if failure := parseTurnResult(item); failure != nil && strings.TrimSpace(accText) == "" {
+							emit(StreamChunk{Error: failure})
+							return
+						}
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
+					if held := citations.flush(); held != "" {
+						logging.Warnf("ChatConversationStreamGen: dropped %d bytes of an unterminated citation marker", len(held))
+					}
+					if strings.TrimSpace(accText) == "" && len(toolCalls) == 0 {
+						emit(StreamChunk{Error: ErrEmptyTurn})
+						return
+					}
 					finishReason := "stop"
 					if len(toolCalls) > 0 {
 						finishReason = "tool_calls"
 					}
 					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d", finishReason, len(toolCalls))
-					emit(StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason})
+					emit(StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason, Throttling: throttling})
 					return
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == -1 {
 					logging.Errorf("ChatConversationStreamGen: server error: %v", data)
@@ -636,6 +718,31 @@ func (c *M365Client) ChatConversationStreamGenContext(
 	}()
 
 	return ch
+}
+
+func snapshotDelta(emitted, snapshot string) (string, bool) {
+	if snapshot == emitted {
+		return "", false
+	}
+	if strings.HasPrefix(snapshot, emitted) {
+		return snapshot[len(emitted):], true
+	}
+	if emitted == "" {
+		return snapshot, true
+	}
+	return "", false
+}
+
+func carriesAnswerText(msg map[string]any) bool {
+	messageType, _ := msg["messageType"].(string)
+	if messageType == "" {
+		return true
+	}
+	if messageType == "Progress" {
+		return false
+	}
+	_, backendTool := models.ToolMessageType[messageType]
+	return !backendTool
 }
 
 // sendRecv sends a payload and waits for the complete response.
@@ -682,7 +789,7 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 								if msgs, ok := argMap["messages"].([]any); ok && len(msgs) > 0 {
 									if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok {
 										if text, ok := lastMsg["text"].(string); ok {
-											fullText = text
+											fullText = stripCitations(text)
 										}
 									}
 								}
@@ -851,4 +958,22 @@ func mapKeys(m map[string]any) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func emptyTurn(accText string, toolCalls []ToolCall) bool {
+	return accText == "" && len(toolCalls) == 0
+}
+
+func parseTurnResult(item map[string]any) *TurnFailedError {
+	result, ok := item["result"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	value, ok := result["value"].(string)
+	if !ok || value == "" || value == "Success" {
+		return nil
+	}
+	message, _ := result["message"].(string)
+	turnState, _ := item["turnState"].(string)
+	return &TurnFailedError{Value: value, TurnState: turnState, Message: message}
 }

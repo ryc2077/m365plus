@@ -34,7 +34,7 @@ func TestInjectSimulatedPromptResponsesUsesOneCanonicalMessage(t *testing.T) {
 	}
 	requestJSON := `{"input":[{"role":"user","content":"old user message"},{"role":"assistant","content":"old assistant message"},{"role":"user","content":"latest user message"}]}`
 
-	injectSimulatedPromptResponses(&messages, requestJSON, "auto")
+	injectSimulatedPromptResponses(&messages, requestJSON, "auto", "")
 
 	if len(messages) != 1 {
 		t.Fatalf("expected one canonical simulation message, got %d: %#v", len(messages), messages)
@@ -357,6 +357,7 @@ func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
 		"",
 		[]client.ToolCall{call},
 		map[string]string{"read_nonce": "function"},
+		false,
 		"tool_calls",
 		1,
 		1,
@@ -600,6 +601,18 @@ func TestMergeLoadedResponsesToolsPreservesDuplicateNamespacedTools(t *testing.T
 	}
 	if tools[0].Namespace != "mcp__node_repl" || tools[1].Namespace != "mcp__browser" {
 		t.Fatalf("loaded namespaces not preserved: %#v", tools)
+	}
+}
+
+func TestDuplicateToolNamePrefersTheCustomDeclaration(t *testing.T) {
+	custom := toolcalling.ToolDef{Type: "custom", Name: "apply_patch"}
+	function := toolcalling.ToolDef{Type: "function", Name: "apply_patch"}
+
+	if got := responsesToolTypes([]toolcalling.ToolDef{custom, function})["apply_patch"]; got != "custom" {
+		t.Errorf("custom declared first lost to %q", got)
+	}
+	if got := responsesToolTypes([]toolcalling.ToolDef{function, custom})["apply_patch"]; got != "custom" {
+		t.Errorf("custom declared second lost to %q", got)
 	}
 }
 
@@ -1700,17 +1713,13 @@ func TestResponsesInputImageMissingPathIgnored(t *testing.T) {
 	}
 }
 
-func TestResponsesInputImageHTTPDownloaded(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		w.Write([]byte("http-png-bytes"))
-	}))
-	defer srv.Close()
+func TestResponsesInputImageURLIsDeferredToSafeResolver(t *testing.T) {
+	remoteURL := "https://example.com/image.png"
 	input := []any{
 		map[string]any{
 			"type":    "message",
 			"role":    "user",
-			"content": []any{map[string]any{"type": "input_image", "image_url": srv.URL}},
+			"content": []any{map[string]any{"type": "input_image", "image_url": remoteURL}},
 		},
 	}
 	messages := responsesInputToMessages(input)
@@ -1718,11 +1727,11 @@ func TestResponsesInputImageHTTPDownloaded(t *testing.T) {
 		t.Fatalf("expected 1 message with 1 image, got %#v", messages)
 	}
 	img := messages[0].Images[0]
-	if img.MediaType != "image/png" {
-		t.Fatalf("http media type = %q", img.MediaType)
+	if img.RemoteURL != remoteURL {
+		t.Fatalf("remote URL = %q, want %q", img.RemoteURL, remoteURL)
 	}
-	if img.Base64 != base64.StdEncoding.EncodeToString([]byte("http-png-bytes")) {
-		t.Fatalf("http image base64 mismatch")
+	if img.MediaType != "" || img.Base64 != "" {
+		t.Fatalf("remote image was fetched during conversion: %#v", img)
 	}
 }
 

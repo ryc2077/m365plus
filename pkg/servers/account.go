@@ -206,7 +206,7 @@ func (api *APIServer) ChatStream(ctx context.Context, acc accounts.AccountToken,
 	if err != nil {
 		return nil, err
 	}
-	prompt := toolcalling.BuildSimulatedPrompt(reqJSON, false, "")
+	prompt := toolcalling.BuildSimulatedPrompt(reqJSON, false, "", "")
 	simulated := append([]payload.Message(nil), messages...)
 	simulated = append(simulated, payload.Message{Role: "user", Content: prompt})
 
@@ -229,7 +229,7 @@ func (api *APIServer) ChatStream(ctx context.Context, acc accounts.AccountToken,
 				raw.WriteString(c.Text)
 			}
 		}
-		res := toolcalling.ParseSimulatedResponse(raw.String(), nil, nil)
+		res := toolcalling.ParseSimulatedResponse(raw.String(), nil, toolcalling.ToolContracts{})
 		text := res.Content
 		if text == "" && res.HasPayload {
 			text = raw.String()

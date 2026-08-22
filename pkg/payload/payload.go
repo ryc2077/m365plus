@@ -90,12 +90,28 @@ var allowedMessageTypes = []string{
 
 // Message represents a chat message in the conversation history.
 type Message struct {
-	Role        string              `json:"role"`
-	Content     string              `json:"content"`
-	Name        string              `json:"name,omitempty"`
-	Images      []ImageData         `json:"-"`
-	Annotations []MessageAnnotation `json:"-"`
-	ToolCallID  string              `json:"tool_call_id,omitempty"` // OpenAI tool role messages
+	Role         string              `json:"role"`
+	Content      string              `json:"content"`
+	Name         string              `json:"name,omitempty"`
+	Images       []ImageData         `json:"-"`
+	Annotations  []MessageAnnotation `json:"-"`
+	ToolCallID   string              `json:"tool_call_id,omitempty"` // OpenAI tool role messages
+	ToolCalls    []ToolCallRecord    `json:"-"`
+	ToolResults  []ToolResultRecord  `json:"-"`
+	ToolProgress bool                `json:"-"`
+}
+
+// ToolCallRecord preserves a flattened assistant tool call for request-local evidence tracking.
+type ToolCallRecord struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// ToolResultRecord preserves a flattened tool result for request-local evidence tracking.
+type ToolResultRecord struct {
+	ID      string
+	Content string
 }
 
 // ImageData represents an image extracted from multimodal content.
@@ -103,6 +119,7 @@ type ImageData struct {
 	Base64    string // raw base64 data without data: prefix
 	MediaType string // e.g. "image/png"
 	FileName  string // e.g. "upload.png"
+	RemoteURL string // caller-supplied remote image URL, resolved by the server
 }
 
 // MessageAnnotation represents an image annotation attached to a WebSocket message.
@@ -137,22 +154,34 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	m.Role = raw.Role
 	m.Name = raw.Name
 	m.ToolCallID = raw.ToolCallID
+	isToolRole := raw.Role == "tool" && raw.ToolCallID != ""
 
 	// Handle OpenAI assistant messages with tool_calls field
 	if len(raw.ToolCalls) > 0 {
 		var sb strings.Builder
 		for _, tc := range raw.ToolCalls {
 			fmt.Fprintf(&sb, "[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments)
+			m.ToolCalls = append(m.ToolCalls, ToolCallRecord{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
 		}
 		m.Content = strings.TrimSpace(sb.String())
 	}
 
 	if len(raw.Content) == 0 {
+		if isToolRole {
+			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID})
+		}
 		return nil
 	}
 
 	// Handle null content (e.g. assistant message with tool_calls and content=null)
 	if string(raw.Content) == "null" {
+		if isToolRole {
+			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID})
+		}
 		return nil
 	}
 
@@ -161,7 +190,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(raw.Content, &s); err == nil {
 		m.Content = s
 		// Convert tool role messages to formatted text
-		if m.Role == "tool" && m.ToolCallID != "" {
+		if isToolRole {
+			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID, Content: s})
 			m.Content = fmt.Sprintf("[Tool Result (call_id: %s)]\n%s", m.ToolCallID, s)
 		}
 		return nil
@@ -176,9 +206,17 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	for _, block := range blocks {
 		blockType, _ := block["type"].(string)
 		switch blockType {
-		case "text":
+		case "text", "input_text", "output_text":
 			if txt, ok := block["text"].(string); ok {
 				m.Content += txt
+			}
+		case "input_image":
+			if url, ok := block["image_url"].(string); ok {
+				if img := ParseDataURL(url); img != nil {
+					m.Images = append(m.Images, *img)
+				} else if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
+					m.Images = append(m.Images, ImageData{RemoteURL: url})
+				}
 			}
 		case "image_url":
 			// OpenAI format: {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
@@ -186,6 +224,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 				if url, ok := imgURL["url"].(string); ok {
 					if img := ParseDataURL(url); img != nil {
 						m.Images = append(m.Images, *img)
+					} else if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
+						m.Images = append(m.Images, ImageData{RemoteURL: url})
 					}
 				}
 			}
@@ -206,10 +246,12 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			}
 		case "tool_use":
 			// Anthropic assistant message: previous tool call
+			id, _ := block["id"].(string)
 			name, _ := block["name"].(string)
 			input := block["input"]
 			if inputBytes, err := json.Marshal(input); err == nil {
 				m.Content += fmt.Sprintf("\n[Previous Tool Call: %s]\nArguments: %s\n", name, string(inputBytes))
+				m.ToolCalls = append(m.ToolCalls, ToolCallRecord{ID: id, Name: name, Arguments: string(inputBytes)})
 			}
 		case "tool_result":
 			// Anthropic user message: tool result
@@ -227,6 +269,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 				}
 			}
 			m.Content += fmt.Sprintf("\n[Tool Result (call_id: %s)]\n%s\n", toolUseID, resultContent)
+			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: toolUseID, Content: resultContent})
 		}
 	}
 

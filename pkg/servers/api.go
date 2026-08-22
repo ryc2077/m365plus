@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -40,6 +41,110 @@ const (
 	// contextCacheMaxSize is the maximum number of in-memory cache entries.
 	contextCacheMaxSize = 256
 )
+
+const (
+	remoteImageMaxBytes   = 20 << 20
+	remoteImageMaxPerTurn = 16
+	remoteImageTimeout    = 30 * time.Second
+)
+
+var errRemoteImageRejected = errors.New("remote image URL rejected")
+
+func ipDisallowed(ip net.IP) bool {
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return false
+}
+
+func validateRemoteImageURL(rawURL string) error {
+	parsed, err := neturl.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errRemoteImageRejected, err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("%w: scheme %q is not https", errRemoteImageRejected, parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("%w: URL has no host", errRemoteImageRejected)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return fmt.Errorf("%w: %q does not resolve", errRemoteImageRejected, host)
+	}
+	if slices.ContainsFunc(ips, ipDisallowed) {
+		return fmt.Errorf("%w: %q resolves to a non-public address", errRemoteImageRejected, host)
+	}
+	return nil
+}
+
+func fetchRemoteImage(rawURL string) (string, string, error) {
+	if err := validateRemoteImageURL(rawURL); err != nil {
+		return "", "", err
+	}
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch remote image: %w", err)
+	}
+	req.Header.Set("User-Agent", "m365plus/"+models.Version)
+	req.Header.Set("Accept", "image/*")
+	resp, err := (&http.Client{Timeout: remoteImageTimeout}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch remote image: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("fetch remote image: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, remoteImageMaxBytes+1))
+	if err != nil {
+		return "", "", fmt.Errorf("read remote image: %w", err)
+	}
+	if len(body) > remoteImageMaxBytes {
+		return "", "", fmt.Errorf("%w: larger than %d bytes", errRemoteImageRejected, remoteImageMaxBytes)
+	}
+	mediaType := resp.Header.Get("Content-Type")
+	if semicolon := strings.IndexByte(mediaType, ';'); semicolon >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:semicolon])
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		return "", "", fmt.Errorf("%w: content type %q is not an image", errRemoteImageRejected, mediaType)
+	}
+	return base64.StdEncoding.EncodeToString(body), mediaType, nil
+}
+
+func resolveRemoteImages(message *payload.Message) {
+	resolved := make([]payload.ImageData, 0, len(message.Images))
+	fetched := 0
+	for _, image := range message.Images {
+		if image.RemoteURL == "" {
+			resolved = append(resolved, image)
+			continue
+		}
+		if fetched >= remoteImageMaxPerTurn {
+			logging.Warnf("resolveRemoteImages: skipping image beyond the per-turn limit of %d", remoteImageMaxPerTurn)
+			continue
+		}
+		fetched++
+		data, mediaType, err := fetchRemoteImage(image.RemoteURL)
+		if err != nil {
+			logging.Errorf("resolveRemoteImages: %v", err)
+			continue
+		}
+		resolved = append(resolved, payload.ImageData{Base64: data, MediaType: mediaType, FileName: "upload." + extFromMediaType(mediaType)})
+	}
+	message.Images = resolved
+}
 
 // SessionState is the persisted state of a conversation across requests. It
 // carries everything the data plane needs to continue an incremental M365
@@ -206,6 +311,23 @@ type APIServer struct {
 	mu              sync.RWMutex
 	accountResolver AccountResolver
 	usageRecorder   UsageRecorder
+	throttlingMu    sync.RWMutex
+	lastThrottling  *client.ThrottlingInfo
+}
+
+func (api *APIServer) noteThrottling(info *client.ThrottlingInfo) {
+	if info == nil {
+		return
+	}
+	api.throttlingMu.Lock()
+	api.lastThrottling = info
+	api.throttlingMu.Unlock()
+}
+
+func (api *APIServer) currentThrottling() *client.ThrottlingInfo {
+	api.throttlingMu.RLock()
+	defer api.throttlingMu.RUnlock()
+	return api.lastThrottling
 }
 
 type UsageRecord struct {
@@ -292,16 +414,89 @@ func (api *APIServer) accountResolverLocked() AccountResolver {
 	return api.accountResolver
 }
 
-// tokenRefreshInterval is the interval for periodic access token refresh.
-const tokenRefreshInterval = 30 * time.Minute
+const (
+	// tokenRefreshInterval is the interval for periodic access token refresh.
+	tokenRefreshInterval = 30 * time.Minute
+	// serverReadHeaderTimeout limits how long a client may take to send headers.
+	serverReadHeaderTimeout = 20 * time.Second
+	// serverIdleTimeout limits how long an unused keep-alive connection remains open.
+	serverIdleTimeout = 120 * time.Second
+	// sseKeepaliveInterval bounds how long a streaming response stays silent.
+	sseKeepaliveInterval = 10 * time.Second
+	// sseWriteTimeout prevents a disconnected client from blocking a stream forever.
+	sseWriteTimeout = 30 * time.Second
+)
+
+type streamOptions struct {
+	IncludeUsage *bool `json:"include_usage"`
+}
+
+func includeStreamUsage(options *streamOptions) bool {
+	return options == nil || options.IncludeUsage == nil || *options.IncludeUsage
+}
+
+func refreshStreamDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+}
+
+func writeSSEKeepalive(w http.ResponseWriter, flusher http.Flusher) error {
+	if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeAnthropicKeepalive(w http.ResponseWriter, flusher http.Flusher) error {
+	if _, err := fmt.Fprint(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func nextStreamChunk(ctx context.Context, chunks <-chan client.StreamChunk, keepalive *time.Ticker, w http.ResponseWriter, writeKeepalive func() error) (client.StreamChunk, bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return client.StreamChunk{}, false
+		case chunk, ok := <-chunks:
+			if ok {
+				keepalive.Reset(sseKeepaliveInterval)
+				refreshStreamDeadline(w)
+			}
+			return chunk, ok
+		case <-keepalive.C:
+			refreshStreamDeadline(w)
+			if err := writeKeepalive(); err != nil {
+				logging.Debugf("nextStreamChunk: keepalive write failed, ending stream: %v", err)
+				return client.StreamChunk{}, false
+			}
+		}
+	}
+}
+
+// withoutBackendToolCalls removes tool calls generated by M365 for its own
+// built-in tools. Callers never declared these tools and cannot execute them.
+func withoutBackendToolCalls(calls []client.ToolCall, finishReason string) ([]client.ToolCall, string) {
+	if len(calls) == 0 {
+		return calls, finishReason
+	}
+	if finishReason == "tool_calls" || finishReason == "tool_use" {
+		finishReason = "stop"
+	}
+	return nil, finishReason
+}
 
 // Start starts the HTTP server on the specified port.
 func (api *APIServer) Start(port int) error {
 	api.mu.Lock()
 	if api.server == nil {
 		api.server = &http.Server{
-			Addr:    fmt.Sprintf(":%d", port),
-			Handler: api.buildHandlerLocked(),
+			Addr:              fmt.Sprintf(":%d", port),
+			Handler:           api.buildHandlerLocked(),
+			ReadHeaderTimeout: serverReadHeaderTimeout,
+			IdleTimeout:       serverIdleTimeout,
 		}
 	}
 	api.mu.Unlock()
@@ -360,6 +555,8 @@ func (api *APIServer) buildHandlerLocked() http.Handler {
 	mux.HandleFunc("/v1/conversations", api.withAuth(api.handleConversations))
 	mux.HandleFunc("/v1/conversations/", api.withAuth(api.handleConversation))
 	mux.HandleFunc("/v1/models", api.handleModels)
+	mux.HandleFunc("/v1/health", api.handleV1Health)
+	mux.HandleFunc("/mcp", api.withAuth(api.handleMCP))
 	mux.HandleFunc("/health", api.handleHealth)
 	return mux
 }
@@ -416,14 +613,14 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if len(api.config.APIKeys) > 0 {
-			provided := r.Header.Get("Authorization")
-			if provided == "" {
-				logging.Warnf("Auth: missing Authorization header from %s", r.RemoteAddr)
-				api.sendError(w, http.StatusUnauthorized, "Missing Authorization header")
-				return
+			valid := false
+			for _, token := range offeredAPIKeys(r) {
+				if api.isValidAPIKey(token) {
+					valid = true
+					break
+				}
 			}
-			token := strings.TrimSpace(strings.TrimPrefix(provided, "Bearer "))
-			if !api.isValidAPIKey(token) {
+			if !valid {
 				logging.Warnf("Auth: invalid API key from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Invalid API key")
 				return
@@ -495,14 +692,36 @@ func (api *APIServer) isValidAPIKey(token string) bool {
 	return slices.Contains(api.config.APIKeys, token)
 }
 
+func offeredAPIKeys(r *http.Request) []string {
+	keys := make([]string, 0, 2)
+	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
+		keys = append(keys, key)
+	}
+	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" {
+		fields := strings.Fields(authorization)
+		if len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+			authorization = fields[1]
+		}
+		if authorization != "" {
+			keys = append(keys, authorization)
+		}
+	}
+	return keys
+}
+
 // extractAPIKey gets the bearer token from the Authorization header.
 // Used as a fallback session ID when no explicit session ID is provided.
 func (api *APIServer) extractAPIKey(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		return ""
+	keys := offeredAPIKeys(r)
+	for _, key := range keys {
+		if api.isValidAPIKey(key) {
+			return key
+		}
 	}
-	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
 }
 
 // Stop stops the HTTP server and background token refresher.
@@ -525,10 +744,62 @@ func (api *APIServer) Stop() error {
 // handleHealth handles health check requests.
 func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
+}
+
+// handleV1Health provides a public JSON reachability probe for OpenAI-compatible clients.
+func (api *APIServer) handleV1Health(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleModels handles model list requests.
+func capabilitySupport(supported bool) map[string]any {
+	return map[string]any{"supported": supported}
+}
+
+func anthropicCapabilities(reasoningRoute, thinking bool) map[string]any {
+	return map[string]any{
+		"batch":          capabilitySupport(false),
+		"citations":      capabilitySupport(false),
+		"code_execution": capabilitySupport(false),
+		"context_management": map[string]any{
+			"supported":                false,
+			"clear_thinking_20251015":  capabilitySupport(false),
+			"clear_tool_uses_20250919": capabilitySupport(false),
+			"compact_20260112":         capabilitySupport(false),
+		},
+		"effort": map[string]any{
+			"supported": reasoningRoute,
+			"low":       capabilitySupport(reasoningRoute),
+			"medium":    capabilitySupport(reasoningRoute),
+			"high":      capabilitySupport(reasoningRoute),
+			"max":       capabilitySupport(reasoningRoute),
+			"xhigh":     capabilitySupport(reasoningRoute),
+		},
+		"image_input":        capabilitySupport(true),
+		"pdf_input":          capabilitySupport(false),
+		"structured_outputs": capabilitySupport(false),
+		"thinking": map[string]any{
+			"supported": thinking,
+			"types": map[string]any{
+				"enabled":  capabilitySupport(thinking),
+				"adaptive": capabilitySupport(false),
+			},
+		},
+	}
+}
+
 func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		api.handleCORS(w, r)
@@ -545,22 +816,65 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 	// M365_MAX_OUTPUT_TOKENS.
 	contextWindow := api.config.ContextWindowTokens
 	maxOutput := api.config.MaxOutputTokens
+	maxInput := contextWindow
+	if maxOutput < contextWindow {
+		maxInput = contextWindow - maxOutput
+	}
 
-	modelList := []map[string]any{}
+	byID := make(map[string]models.ModelConfig, len(models.ModelRegistry))
 	for _, cfg := range models.ModelRegistry {
+		byID[cfg.OpenAIID] = cfg
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	modelList := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		cfg := byID[id]
+		reasoningRoute := slices.ContainsFunc(models.RegistryKeysFor(id), func(key string) bool {
+			return strings.HasSuffix(key, "-reasoning")
+		}) || applyReasoningEffort(id, cfg, true) != cfg
+		thinking := cfg.Thinking
+		owner := cfg.OwnerOrDefault()
+		if strings.HasPrefix(id, "claude") {
+			owner = models.OwnerAnthropic
+		}
+		capabilities := map[string]any{
+			"chat_completions": true, "responses": true, "streaming": true,
+			"tools": true, "supports_tools": true, "function_calling": true,
+			"reasoning": true, "vision": true,
+		}
+		for name, value := range anthropicCapabilities(reasoningRoute, thinking) {
+			capabilities[name] = value
+		}
 		modelList = append(modelList, map[string]any{
-			"id":                cfg.OpenAIID,
-			"object":            "model",
-			"created":           1700000000,
-			"owned_by":          "microsoft",
-			"context_window":    contextWindow,
-			"max_output_tokens": maxOutput,
+			"id": id, "slug": id, "object": "model", "type": "model",
+			"created": 1700000000, "created_at": time.Unix(1700000000, 0).UTC().Format(time.RFC3339),
+			"owned_by": owner, "shutdown_date": nil,
+			"display_name":   cfg.DisplayNameOrDefault(),
+			"context_window": contextWindow, "max_context_window": contextWindow,
+			"max_input_tokens": maxInput, "max_output_tokens": maxOutput, "max_tokens": maxOutput,
+			"supports_tools": true, "tool_calls": true, "function_calling": true,
+			"base_instructions":     "You are a helpful AI assistant. Provide complete, working implementations when writing code.",
+			"apply_patch_tool_type": "freeform", "default_reasoning_level": "medium",
+			"supported_reasoning_levels": models.ReasoningEffortPresets,
+			"capabilities":               capabilities,
 		})
 	}
 
 	response := map[string]any{
-		"object": "list",
-		"data":   modelList,
+		"object": "list", "data": modelList, "has_more": false,
+		"reasoning_effort_presets": models.ReasoningEffortPresets,
+	}
+	if len(ids) > 0 {
+		response["first_id"] = ids[0]
+		response["last_id"] = ids[len(ids)-1]
+	} else {
+		response["first_id"] = nil
+		response["last_id"] = nil
 	}
 
 	api.sendJSON(w, http.StatusOK, response)
@@ -688,7 +1002,7 @@ func (api *APIServer) sendConversationError(w http.ResponseWriter, err error) {
 func (api *APIServer) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Session-Id")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -871,6 +1185,127 @@ func replaceRequestTools(body []byte, tools []toolcalling.ToolDef) string {
 	return string(updated)
 }
 
+func activeToolMessages(messages []payload.Message) []payload.Message {
+	start := 0
+	for i := range messages {
+		if messages[i].Role != "user" || len(messages[i].ToolResults) > 0 || messages[i].ToolProgress {
+			continue
+		}
+		start = i
+	}
+	return messages[start:]
+}
+
+func buildToolLedger(messages []payload.Message) toolcalling.Ledger {
+	active := activeToolMessages(messages)
+	var calls []toolcalling.LedgerCall
+	var results []toolcalling.LedgerResult
+	rounds := 0
+	for i := range active {
+		if len(active[i].ToolCalls) > 0 {
+			rounds++
+		}
+		for _, call := range active[i].ToolCalls {
+			calls = append(calls, toolcalling.LedgerCall{ID: call.ID, Name: call.Name, Arguments: call.Arguments})
+		}
+		for _, result := range active[i].ToolResults {
+			results = append(results, toolcalling.LedgerResult{ID: result.ID, Content: result.Content})
+		}
+	}
+	return toolcalling.BuildLedger(calls, results, rounds)
+}
+
+func validateToolResultMessages(messages []payload.Message) error {
+	known := make(map[string]bool)
+	for i := range messages {
+		for _, call := range messages[i].ToolCalls {
+			if call.ID == "" {
+				continue
+			}
+			if known[call.ID] {
+				return fmt.Errorf("tool call id %q is declared more than once in this request", call.ID)
+			}
+			known[call.ID] = true
+		}
+	}
+
+	answered := make(map[string]bool)
+	for i := range messages {
+		if messages[i].Role == "tool" && messages[i].ToolCallID == "" {
+			return errors.New(`a message with role "tool" is missing tool_call_id`)
+		}
+		for _, result := range messages[i].ToolResults {
+			if result.ID == "" {
+				return errors.New("a tool result is missing the id of the tool call it answers")
+			}
+			if len(known) > 0 && !known[result.ID] {
+				return fmt.Errorf("tool result %q does not answer any tool call in this request", result.ID)
+			}
+			if answered[result.ID] {
+				return fmt.Errorf("tool call %q is answered more than once in this request", result.ID)
+			}
+			answered[result.ID] = true
+		}
+	}
+	return nil
+}
+
+func toolChoiceForcesACall(toolChoice string) bool {
+	switch toolChoice {
+	case "", "auto", "none":
+		return false
+	default:
+		return true
+	}
+}
+
+func dropSettledToolCalls(ledger toolcalling.Ledger, toolChoice string, simulated toolcalling.SimulatedResult) toolcalling.SimulatedResult {
+	if len(simulated.ToolCalls) == 0 || toolChoiceForcesACall(toolChoice) {
+		return simulated
+	}
+	kept, dropped := ledger.FilterRepeated(simulated.ToolCalls)
+	if len(dropped) == 0 {
+		return simulated
+	}
+	for _, call := range dropped {
+		logging.Warnf("dropSettledToolCalls: dropping %q because its result is already present in this turn", call.Name)
+	}
+	simulated.ToolCalls = kept
+	if len(kept) == 0 {
+		simulated.FinishReason = "stop"
+		if strings.TrimSpace(simulated.Content) == "" {
+			simulated.Content = toolcalling.RepeatedCallsNotice
+		}
+	}
+	return simulated
+}
+
+const toolRoundLimitCode = "tool_round_limit"
+
+func (api *APIServer) exceededToolRoundLimit(ledger toolcalling.Ledger) bool {
+	limit := api.config.MaxToolRounds
+	if limit <= 0 {
+		limit = models.DefaultMaxToolRounds
+	}
+	return ledger.Rounds > limit
+}
+
+func (api *APIServer) sendToolRoundLimitError(w http.ResponseWriter, ledger toolcalling.Ledger) {
+	limit := api.config.MaxToolRounds
+	if limit <= 0 {
+		limit = models.DefaultMaxToolRounds
+	}
+	logging.Warnf("tool round limit reached: rounds=%d limit=%d completed=%d repeatedCall=%v repeatedFailure=%v", ledger.Rounds, limit, len(ledger.Completed), ledger.RepeatedCall, ledger.RepeatedFailure)
+	message := fmt.Sprintf("tool round limit reached: this turn drove %d tool rounds with %d completed calls, above the limit of %d; raise M365_MAX_TOOL_ROUNDS or start a new turn", ledger.Rounds, len(ledger.Completed), limit)
+	api.sendJSON(w, http.StatusConflict, map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "invalid_request_error",
+			"code":    toolRoundLimitCode,
+		},
+	})
+}
+
 func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, sid, convID string, tools []toolcalling.ToolDef, local map[string]bool) (toolLoopResult, error) {
 	m365 := api.accountClientFrom(reqAccountFrom(r))
 	if turn := api.sessionTurnFor(sid); turn != nil {
@@ -892,9 +1327,9 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		}
 		var simulated toolcalling.SimulatedResult
 		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		}
 		simulated = api.repairSimulatedToolCalls(r, provider, messages, cfg, sid, tools, simulated)
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
@@ -921,7 +1356,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		}
 		var resultParts []string
 		for _, call := range localCalls {
-			key := call.Name + "\x00" + string(call.Arguments)
+			key := toolcalling.CallSignature(call.Name, string(call.Arguments))
 			if seen[key] {
 				return toolLoopResult{}, fmt.Errorf("duplicate coding tool call %q", call.Name)
 			}
@@ -942,10 +1377,11 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		if err != nil {
 			return toolLoopResult{}, fmt.Errorf("serialize coding tool continuation: %w", err)
 		}
+		evidence := buildToolLedger(messages).EvidenceNote()
 		if provider == toolLoopAnthropic {
-			injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto")
+			injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto", evidence)
 		} else {
-			injectSimulatedPrompt(&messages, string(requestJSON), "auto")
+			injectSimulatedPrompt(&messages, string(requestJSON), "auto", evidence)
 		}
 	}
 }
@@ -962,19 +1398,19 @@ func (api *APIServer) repairSimulatedToolCalls(r *http.Request, provider toolLoo
 		m365 = m365.WithSession(turn)
 	}
 	oid, tid := api.accountOIDTID(r)
-	if len(sim.ToolCalls) > 0 || len(sim.DroppedMissingArgs) == 0 || len(messages) == 0 {
+	if len(sim.ToolCalls) > 0 || len(sim.DroppedCalls) == 0 || len(messages) == 0 {
 		return sim
 	}
 
-	requiredByTool := toolcalling.RequiredArgsByTool(tools)
-	note := toolcalling.BuildRepairNote(sim.DroppedMissingArgs, requiredByTool)
+	contracts := toolcalling.ContractsFor(tools)
+	note := toolcalling.BuildRepairNote(sim.DroppedCalls, contracts)
 	retry := make([]payload.Message, len(messages))
 	copy(retry, messages)
 	last := retry[len(retry)-1]
 	last.Content = last.Content + "\n\n" + note
 	retry[len(retry)-1] = last
 
-	logging.Warnf("repairSimulatedToolCalls: re-asking backend for tools missing required args: %v", sim.DroppedMissingArgs)
+	logging.Warnf("repairSimulatedToolCalls: re-asking backend for rejected tool calls: %v", sim.DroppedNames())
 	text, _, _, _, _, err := m365.ChatConversation(retry, cfg.Tone, cfg.Override, "", oid, tid, true)
 	if err != nil {
 		logging.Errorf("repairSimulatedToolCalls: retry failed: %v", err)
@@ -983,9 +1419,9 @@ func (api *APIServer) repairSimulatedToolCalls(r *http.Request, provider toolLoo
 
 	var retried toolcalling.SimulatedResult
 	if provider == toolLoopAnthropic {
-		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), requiredByTool)
+		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
 	} else {
-		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), requiredByTool)
+		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
 	}
 	if len(retried.ToolCalls) > 0 {
 		logging.Infof("repairSimulatedToolCalls: recovered %d tool call(s) after re-ask", len(retried.ToolCalls))
@@ -1023,11 +1459,21 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		User           string                `json:"user"`
 		Tools          []toolcalling.ToolDef `json:"tools"`
 		ToolChoice     any                   `json:"tool_choice"`
+		StreamOptions  *streamOptions        `json:"stream_options"`
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		logging.Errorf("handleChatCompletions: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if err := validateToolResultMessages(req.Messages); err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ledger := buildToolLedger(req.Messages)
+	if api.exceededToolRoundLimit(ledger) {
+		api.sendToolRoundLimitError(w, ledger)
 		return
 	}
 
@@ -1054,7 +1500,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	req.Tools = preparedTools
 	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
-		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice))
+		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice), buildToolLedger(req.Messages).EvidenceNote())
 	}
 
 	// Resolve session ID and conversation ID
@@ -1097,14 +1543,14 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if len(localTools) > 0 {
 		result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, sid, convID, req.Tools, localTools)
 		if err != nil {
-			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+			api.sendUpstreamError(w, "chat", err)
 			return
 		}
-		api.respondBufferedChat(w, result, cfg, sid, req.MaxTokens, req.Stream)
+		api.respondBufferedChat(w, result, req.Messages, cfg, sid, req.MaxTokens, req.Stream, req.Tools, toolChoiceString(req.ToolChoice))
 		return
 	}
 	if req.Stream {
-		api.streamChatCompletions(r, w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
+		api.streamChatCompletions(r, w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, includeStreamUsage(req.StreamOptions))
 	} else {
 		api.nonStreamChatCompletions(r, w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
 	}
@@ -1156,7 +1602,7 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 
 	// Inject simulated tool prompt if tool calling is enabled
 	if len(req.Tools) > 0 {
-		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice), buildToolLedger(messages).EvidenceNote())
 	}
 
 	// Resolve session ID and conversation ID
@@ -1285,6 +1731,15 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
+	if err := validateToolResultMessages(req.Messages); err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ledger := buildToolLedger(req.Messages)
+	if api.exceededToolRoundLimit(ledger) {
+		api.sendToolRoundLimitError(w, ledger)
+		return
+	}
 
 	// Parse optional session ID encoded in model name: "gpt5.5:my-session".
 	// The ":persist" suffix pins a stable per-API-key persistent session.
@@ -1312,7 +1767,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	req.Tools = preparedTools
 	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
-		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice))
+		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice), buildToolLedger(chatMessages).EvidenceNote())
 	}
 
 	// Resolve session ID and conversation ID
@@ -1340,10 +1795,10 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	if len(localTools) > 0 {
 		result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, sid, convID, req.Tools, localTools)
 		if err != nil {
-			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+			api.sendUpstreamError(w, "chat", err)
 			return
 		}
-		api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream)
+		api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice))
 		return
 	}
 	if req.Stream {
@@ -1412,7 +1867,7 @@ func (api *APIServer) nonStreamAnthropicComplete(r *http.Request, w http.Respons
 	oid, tid := api.accountOIDTID(r)
 	respText, _, _, _, finalConvID, err := m365.ChatConversation(messages, cfg.Tone, cfg.Override, convID, oid, tid, false)
 	if err != nil {
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
+		api.sendUpstreamError(w, "completion", err)
 		return
 	}
 
@@ -1487,11 +1942,20 @@ func (api *APIServer) streamAnthropicComplete(r *http.Request, w http.ResponseWr
 
 	var finalConvID string
 	var finalToolCalls []client.ToolCall
-	for chunk := range ch {
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(r.Context(), ch, keepalive, w, func() error {
+			return writeAnthropicKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
+			status, _, message := streamErrorFields("completion", chunk.Error)
 			errData := map[string]any{
 				"type":  "error",
-				"error": map[string]any{"type": "server_error", "message": chunk.Error.Error()},
+				"error": map[string]any{"type": openAIErrorType(status), "message": message},
 			}
 			errJSON, _ := json.Marshal(errData)
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
@@ -1500,8 +1964,9 @@ func (api *APIServer) streamAnthropicComplete(r *http.Request, w http.ResponseWr
 		}
 
 		if chunk.IsFinal {
+			api.noteThrottling(chunk.Throttling)
 			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+			finalToolCalls, _ = withoutBackendToolCalls(chunk.ToolCalls, chunk.FinishReason)
 			break
 		}
 
@@ -1569,7 +2034,7 @@ func (api *APIServer) streamAnthropicComplete(r *http.Request, w http.ResponseWr
 }
 
 // streamChatCompletions streams chat completion responses in OpenAI format.
-func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, includeUsage bool) {
 	m365 := api.accountClientFrom(reqAccountFrom(r))
 	if turn := api.sessionTurnFor(sid); turn != nil {
 		m365 = m365.WithSession(turn)
@@ -1605,7 +2070,19 @@ func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWrit
 
 	var finalConvID string
 	var finalToolCalls []client.ToolCall
-	for chunk := range ch {
+	refreshStreamDeadline(w)
+	if err := writeSSEKeepalive(w, flusher); err != nil {
+		return
+	}
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(r.Context(), ch, keepalive, w, func() error {
+			return writeSSEKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
@@ -1615,8 +2092,9 @@ func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWrit
 		}
 
 		if chunk.IsFinal {
+			api.noteThrottling(chunk.Throttling)
 			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+			finalToolCalls, _ = withoutBackendToolCalls(chunk.ToolCalls, chunk.FinishReason)
 			break
 		}
 
@@ -1683,8 +2161,9 @@ func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWrit
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopOpenAI, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1692,8 +2171,11 @@ func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWrit
 			} else {
 				fullText = sim.Content
 			}
+		} else {
+			fullText = toolcalling.WithholdTransportEnvelope(fullText)
 		}
 	}
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
 
 	if toolCallingEnabled {
 		if rem := thinkingFilter.Flush(); rem != "" {
@@ -1779,11 +2261,14 @@ func (api *APIServer) streamChatCompletions(r *http.Request, w http.ResponseWrit
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(fullText)
 	reasoningTok := countTokens(thinkingText.String())
-	usage := map[string]any{
-		"prompt_tokens":     promptTok,
-		"completion_tokens": completionTok,
-		"reasoning_tokens":  reasoningTok,
-		"total_tokens":      promptTok + completionTok + reasoningTok,
+	var usage map[string]any
+	if includeUsage {
+		usage = map[string]any{
+			"prompt_tokens":     promptTok,
+			"completion_tokens": completionTok,
+			"reasoning_tokens":  reasoningTok,
+			"total_tokens":      promptTok + completionTok + reasoningTok,
+		}
 	}
 
 	api.sendSSEDone(w, chunkID, openaiModel, finishReason, usage)
@@ -1834,7 +2319,7 @@ func (api *APIServer) sessionTurnFor(sid string) *payload.SessionTurn {
 	}
 }
 
-func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoopResult, cfg models.ModelConfig, sid string, maxTokens int, stream bool) {
+func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string) {
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
 			result.text, result.finishReason = truncated, "length"
@@ -1843,6 +2328,7 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 	if sid != "" && result.conversationID != "" {
 		api.ctxCache.Set("session:"+sid, result.conversationID)
 	}
+	usage := openAIUsage(messages, tools, toolChoice, result.text, result.thinking)
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		id := fmt.Sprintf("chatcmpl-%s", uuid.New().String())
@@ -1852,7 +2338,7 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 		for i, call := range result.toolCalls {
 			api.sendSSEChunk(w, id, cfg.OpenAIID, map[string]any{"tool_calls": []map[string]any{{"index": i, "id": call.ID, "type": "function", "function": map[string]string{"name": call.Function.Name, "arguments": call.Function.Arguments}}}})
 		}
-		api.sendSSEDone(w, id, cfg.OpenAIID, result.finishReason, nil)
+		api.sendSSEDone(w, id, cfg.OpenAIID, result.finishReason, usage)
 		return
 	}
 	message := map[string]any{"role": "assistant", "content": result.text}
@@ -1860,7 +2346,7 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 		message["content"] = nil
 		message["tool_calls"] = result.toolCalls
 	}
-	api.sendJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-%s", uuid.New().String()), "object": "chat.completion", "created": time.Now().Unix(), "model": cfg.OpenAIID, "choices": []map[string]any{{"index": 0, "message": message, "finish_reason": result.finishReason}}})
+	api.sendJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-%s", uuid.New().String()), "object": "chat.completion", "created": time.Now().Unix(), "model": cfg.OpenAIID, "choices": []map[string]any{{"index": 0, "message": message, "finish_reason": result.finishReason}}, "usage": usage})
 }
 
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
@@ -1875,9 +2361,10 @@ func (api *APIServer) nonStreamChatCompletions(r *http.Request, w http.ResponseW
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+		api.sendUpstreamError(w, "chat", err)
 		return
 	}
+	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -1889,8 +2376,9 @@ func (api *APIServer) nonStreamChatCompletions(r *http.Request, w http.ResponseW
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopOpenAI, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -1911,9 +2399,11 @@ func (api *APIServer) nonStreamChatCompletions(r *http.Request, w http.ResponseW
 			// its own server-side tools and returned plain text). Since
 			// we discarded backend-injected toolCalls above, reset the
 			// finish reason so we don't report tool_use with no blocks.
+			respText = toolcalling.WithholdTransportEnvelope(respText)
 			finishReason = "stop"
 		}
 	}
+	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
 
 	// Enforce max_tokens on response text
 	if maxTokens > 0 {
@@ -2039,16 +2529,25 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 
 	var finalConvID string
 	var finalToolCalls []client.ToolCall
-	for chunk := range ch {
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(r.Context(), ch, keepalive, w, func() error {
+			return writeAnthropicKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
+			status, _, message := streamErrorFields("anthropic chat", chunk.Error)
 			errEvent := map[string]any{
 				"type": "error",
 				"error": map[string]any{
-					"type":    "server_error",
-					"message": chunk.Error.Error(),
+					"type":    openAIErrorType(status),
+					"message": message,
 				},
 			}
 			api.sendAnthropicSSE(w, "error", errEvent)
@@ -2057,8 +2556,9 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 		}
 
 		if chunk.IsFinal {
+			api.noteThrottling(chunk.Throttling)
 			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+			finalToolCalls, _ = withoutBackendToolCalls(chunk.ToolCalls, chunk.FinishReason)
 			break
 		}
 
@@ -2071,7 +2571,7 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 				// the model's reasoning is visible without exposing the mechanism.
 				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
 					if !thinkingBlockOpen {
-						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
 						thinkingBlockOpen = true
 					}
 					api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": emit}})
@@ -2083,7 +2583,7 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 				cbStart := map[string]any{
 					"type":          "content_block_start",
 					"index":         blockIndex,
-					"content_block": map[string]any{"type": "thinking", "thinking": ""},
+					"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
 				}
 				api.sendAnthropicSSE(w, "content_block_start", cbStart)
 				thinkingBlockOpen = true
@@ -2103,7 +2603,7 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 		if toolCallingEnabled && !thinkingClosed {
 			if rem := thinkingFilter.Flush(); rem != "" {
 				if !thinkingBlockOpen {
-					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
 					thinkingBlockOpen = true
 				}
 				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
@@ -2152,8 +2652,9 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopAnthropic, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2161,15 +2662,18 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 			} else {
 				fullText = sim.Content
 			}
+		} else {
+			fullText = toolcalling.WithholdTransportEnvelope(fullText)
 		}
 	}
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
 
 	// Flush any remaining filtered thinking when the response was thinking-only
 	// (no content chunk triggered the in-loop transition) and close its block.
 	if toolCallingEnabled && !thinkingClosed {
 		if rem := thinkingFilter.Flush(); rem != "" {
 			if !thinkingBlockOpen {
-				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
 				thinkingBlockOpen = true
 			}
 			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
@@ -2300,7 +2804,7 @@ func (api *APIServer) streamAnthropicMessages(r *http.Request, w http.ResponseWr
 	}
 }
 
-func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model, sid string, maxTokens int, stream bool) {
+func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model, sid string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string) {
 	stopReason := "end_turn"
 	if len(result.toolCalls) > 0 {
 		stopReason = "tool_use"
@@ -2324,13 +2828,14 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 	if sid != "" && result.conversationID != "" {
 		api.ctxCache.Set("session:"+sid, result.conversationID)
 	}
-	response := map[string]any{"id": fmt.Sprintf("msg_%s", uuid.New().String()), "type": "message", "role": "assistant", "content": content, "model": model, "stop_reason": stopReason, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": countTokens(result.text)}}
+	usage := anthropicUsage(messages, tools, toolChoice, result.text, result.thinking)
+	response := map[string]any{"id": fmt.Sprintf("msg_%s", uuid.New().String()), "type": "message", "role": "assistant", "content": content, "model": model, "stop_reason": stopReason, "stop_sequence": nil, "usage": usage}
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": 0}}})
+	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": 0, "usage_source": usage["usage_source"]}}})
 	for i, block := range content {
 		switch block["type"] {
 		case "tool_use":
@@ -2354,7 +2859,7 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 		}
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
+	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": usage["output_tokens"], "reasoning_tokens": usage["reasoning_tokens"], "usage_source": usage["usage_source"]}})
 	api.sendAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 }
 
@@ -2370,9 +2875,10 @@ func (api *APIServer) nonStreamAnthropicMessages(r *http.Request, w http.Respons
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+		api.sendUpstreamError(w, "chat", err)
 		return
 	}
+	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -2384,8 +2890,9 @@ func (api *APIServer) nonStreamAnthropicMessages(r *http.Request, w http.Respons
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopAnthropic, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2406,9 +2913,11 @@ func (api *APIServer) nonStreamAnthropicMessages(r *http.Request, w http.Respons
 			// its own server-side tools and returned plain text). Since
 			// we discarded backend-injected toolCalls above, reset the
 			// finish reason so we don't report tool_use with no blocks.
+			respText = toolcalling.WithholdTransportEnvelope(respText)
 			finishReason = "stop"
 		}
 	}
+	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
 
 	stopReason := "end_turn"
 	if finishReason == "tool_calls" {
@@ -2425,7 +2934,7 @@ func (api *APIServer) nonStreamAnthropicMessages(r *http.Request, w http.Respons
 
 	content := []map[string]any{}
 	if thinking != "" {
-		content = append(content, map[string]any{"type": "thinking", "thinking": thinking})
+		content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": ""})
 	}
 	if respText != "" {
 		content = append(content, map[string]any{"type": "text", "text": respText})
@@ -2502,8 +3011,21 @@ func (api *APIServer) streamCompletions(r *http.Request, w http.ResponseWriter, 
 
 	var finalConvID string
 	var finalToolCalls []client.ToolCall
-	for chunk := range ch {
+	refreshStreamDeadline(w)
+	if err := writeSSEKeepalive(w, flusher); err != nil {
+		return
+	}
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(r.Context(), ch, keepalive, w, func() error {
+			return writeSSEKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
+			_, _, message := streamErrorFields("completion", chunk.Error)
 			errChunk := map[string]any{
 				"id":      compID,
 				"object":  "text_completion",
@@ -2512,7 +3034,7 @@ func (api *APIServer) streamCompletions(r *http.Request, w http.ResponseWriter, 
 				"choices": []map[string]any{
 					{
 						"index":         0,
-						"text":          fmt.Sprintf("Error: %v", chunk.Error),
+						"text":          "Error: " + message,
 						"finish_reason": "stop",
 						"logprobs":      nil,
 					},
@@ -2526,8 +3048,9 @@ func (api *APIServer) streamCompletions(r *http.Request, w http.ResponseWriter, 
 		}
 
 		if chunk.IsFinal {
+			api.noteThrottling(chunk.Throttling)
 			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+			finalToolCalls, _ = withoutBackendToolCalls(chunk.ToolCalls, chunk.FinishReason)
 			break
 		}
 
@@ -2574,8 +3097,9 @@ func (api *APIServer) streamCompletions(r *http.Request, w http.ResponseWriter, 
 	// Parse simulated tool calls from buffered text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopOpenAI, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2583,8 +3107,11 @@ func (api *APIServer) streamCompletions(r *http.Request, w http.ResponseWriter, 
 			} else {
 				fullText = sim.Content
 			}
+		} else {
+			fullText = toolcalling.WithholdTransportEnvelope(fullText)
 		}
 	}
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
 
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
@@ -2651,7 +3178,7 @@ func (api *APIServer) nonStreamCompletions(r *http.Request, w http.ResponseWrite
 	oid, tid := api.accountOIDTID(r)
 	respText, thinking, toolCalls, finishReason, finalConvID, err := m365.ChatConversation(messages, cfg.Tone, cfg.Override, convID, oid, tid, hasTools)
 	if err != nil {
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
+		api.sendUpstreamError(w, "completion", err)
 		return
 	}
 
@@ -2662,8 +3189,9 @@ func (api *APIServer) nonStreamCompletions(r *http.Request, w http.ResponseWrite
 
 	// Parse simulated tool calls from response text
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		sim = api.repairSimulatedToolCalls(r, toolLoopOpenAI, messages, cfg, sid, tools, sim)
+		sim = dropSettledToolCalls(buildToolLedger(messages), "auto", sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2680,9 +3208,11 @@ func (api *APIServer) nonStreamCompletions(r *http.Request, w http.ResponseWrite
 				finishReason = "stop"
 			}
 		} else {
+			respText = toolcalling.WithholdTransportEnvelope(respText)
 			finishReason = "stop"
 		}
 	}
+	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
 
 	// Enforce max_tokens on response text
 	if maxTokens > 0 {
@@ -2759,13 +3289,36 @@ func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) 
 
 // sendError sends an error response.
 func (api *APIServer) sendError(w http.ResponseWriter, statusCode int, message string) {
-	api.sendJSON(w, statusCode, map[string]any{
-		"error": map[string]any{
-			"message": message,
-			"type":    "error",
-			"code":    statusCode,
-		},
-	})
+	api.sendErrorCode(w, statusCode, openAIErrorCode(statusCode), message)
+}
+
+const unverifiedCompletionNotice = "No tool was called in this turn and no tool result exists, so the reported completion is not verified. Nothing was executed."
+
+func withoutUnverifiedCompletionClaim(respText string, hasTools bool, ledger toolcalling.Ledger, toolCalls []client.ToolCall) string {
+	return replaceUnverifiedCompletionClaim(respText, hasTools, ledger, len(toolCalls))
+}
+
+func replaceUnverifiedCompletionClaim(respText string, hasTools bool, ledger toolcalling.Ledger, toolCallCount int) string {
+	if !unverifiedCompletionClaim(respText, hasTools, ledger, toolCallCount) {
+		return respText
+	}
+	logging.Warn("replacing an unverified completion claim: the turn called no tool and holds no tool result")
+	logging.Debugf("unverified completion claim was: %q", respText)
+	return unverifiedCompletionNotice
+}
+
+func unverifiedCompletionClaim(respText string, hasTools bool, ledger toolcalling.Ledger, toolCallCount int) bool {
+	if !hasTools || toolCallCount > 0 || len(ledger.Completed) > 0 {
+		return false
+	}
+	return toolcalling.ClaimsUnverifiedCompletion(respText)
+}
+
+func warnOnUnverifiedCompletionClaim(respText string, hasTools bool, ledger toolcalling.Ledger, toolCallCount int) {
+	if unverifiedCompletionClaim(respText, hasTools, ledger, toolCallCount) {
+		logging.Warn("unverified completion claim on a streaming turn: the text was already sent to the client and could not be replaced")
+		logging.Debugf("unverified completion claim was: %q", respText)
+	}
 }
 
 // sendSSEChunk sends a Server-Sent Events chunk in OpenAI chat.completion.chunk format.
@@ -2818,6 +3371,7 @@ func (api *APIServer) sendSSEDone(w http.ResponseWriter, chunkID, model, finishR
 
 // sendSSEError sends an error via SSE.
 func (api *APIServer) sendSSEError(w http.ResponseWriter, chunkID, model string, err error) {
+	status, code, message := streamErrorFields("chat", err)
 	chunk := map[string]any{
 		"id":      chunkID,
 		"object":  "chat.completion.chunk",
@@ -2826,9 +3380,14 @@ func (api *APIServer) sendSSEError(w http.ResponseWriter, chunkID, model string,
 		"choices": []map[string]any{
 			{
 				"index":         0,
-				"delta":         map[string]any{"content": fmt.Sprintf("Error: %v", err)},
+				"delta":         map[string]any{"content": "Error: " + message},
 				"finish_reason": "stop",
 			},
+		},
+		"error": map[string]any{
+			"message": message,
+			"type":    openAIErrorType(status),
+			"code":    code,
 		},
 	}
 
@@ -2847,6 +3406,10 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 // to the M365 backend and attaches the resulting docId annotations to the
 // last message with images. This enables multimodal image input support.
 func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]payload.Message, convID string) {
+	for i := range *messages {
+		resolveRemoteImages(&(*messages)[i])
+	}
+
 	m365 := api.accountClientFrom(reqAccountFrom(r))
 	oid, tid := api.accountOIDTID(r)
 	// Find the last message with images
@@ -2923,11 +3486,11 @@ func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 // injectSimulatedPrompt replaces the last user message with a simulated-mode
 // prompt that embeds the entire OpenAI request JSON and asks M365 Copilot to
 // produce a valid chat.completion response in a single ```json block.
-func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice string) {
+func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	if len(*messages) == 0 {
 		return
 	}
-	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
+	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice, evidence)
 	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
@@ -2943,8 +3506,8 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 // injectSimulatedPromptResponses replaces the converted Responses history with
 // one canonical simulation message. The full history remains present exactly
 // once inside requestJSON, avoiding duplicated context at the M365 layer.
-func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice string) {
-	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice)
+func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
+	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice, evidence)
 	canonical := payload.Message{Role: "user", Content: prompt}
 	for _, message := range *messages {
 		canonical.Images = append(canonical.Images, message.Images...)
@@ -2957,11 +3520,11 @@ func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, to
 // simulated-mode prompt that embeds the entire Anthropic request JSON and asks
 // M365 Copilot to produce a valid Anthropic Messages response in a single
 // ```json block.
-func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, toolChoice string) {
+func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	if len(*messages) == 0 {
 		return
 	}
-	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
+	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice, evidence)
 	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
@@ -2984,6 +3547,15 @@ func anthropicToolChoiceString(toolChoice map[string]any) string {
 		return t
 	}
 	return ""
+}
+
+func anthropicToolChoiceEnforcement(toolChoice map[string]any) string {
+	kind := anthropicToolChoiceString(toolChoice)
+	if kind != "tool" {
+		return kind
+	}
+	name, _ := toolChoice["name"].(string)
+	return name
 }
 
 // toolChoiceString normalizes the tool_choice field to a string ("auto",
@@ -3017,6 +3589,11 @@ type responsesToolPolicy struct {
 	promptChoice     string
 	allowedToolNames []string
 	tools            []toolcalling.ToolDef
+	ledger           toolcalling.Ledger
+}
+
+func (p responsesToolPolicy) allows(name string) bool {
+	return slices.Contains(p.allowedToolNames, name)
 }
 
 type responsesSimulationResult struct {
@@ -3026,14 +3603,15 @@ type responsesSimulationResult struct {
 }
 
 func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (responsesToolPolicy, error) {
-	allNames := responsesToolNames(tools)
+	routeableTools := toolcalling.RouteableTools(tools)
+	allNames := responsesToolNames(routeableTools)
 	knownNames := make(map[string]bool, len(tools))
 	for _, name := range allNames {
 		knownNames[name] = true
 	}
 
 	policy := responsesToolPolicy{
-		simulate:         len(tools) > 0,
+		simulate:         len(allNames) > 0,
 		promptChoice:     "auto",
 		allowedToolNames: allNames,
 		tools:            tools,
@@ -3054,6 +3632,9 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 			policy.required = true
 			policy.promptChoice = "required"
 		default:
+			if strings.EqualFold(choice, toolcalling.WebSearchToolName) {
+				break
+			}
 			if !knownNames[choice] {
 				return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice %q", choice)
 			}
@@ -3134,7 +3715,11 @@ func responsesToolTypes(tools []toolcalling.ToolDef) map[string]string {
 		if toolType == "" {
 			toolType = "function"
 		}
-		types[responsesToolKey(tool.Namespace, name)] = toolType
+		key := responsesToolKey(tool.Namespace, name)
+		if types[key] == "custom" {
+			continue
+		}
+		types[key] = toolType
 	}
 	return types
 }
@@ -3232,6 +3817,35 @@ func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcal
 	return tools
 }
 
+func responsesCustomToolItemID(callID string) string {
+	return "ctc_" + strings.TrimPrefix(callID, "call_")
+}
+
+type responsesStreamEvent struct {
+	name string
+	data map[string]any
+}
+
+func responsesToolInputEvents(callID string, call client.ToolCall, toolTypes map[string]string, outputIndex int) []responsesStreamEvent {
+	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
+	switch toolTypes[toolKey] {
+	case "tool_search":
+		return nil
+	case "custom":
+		itemID := responsesCustomToolItemID(callID)
+		input := extractCustomToolInput(call.Function.Arguments)
+		return []responsesStreamEvent{
+			{name: "response.custom_tool_call_input.delta", data: map[string]any{"item_id": itemID, "output_index": outputIndex, "delta": input}},
+			{name: "response.custom_tool_call_input.done", data: map[string]any{"item_id": itemID, "output_index": outputIndex, "input": input, "name": call.Function.Name}},
+		}
+	default:
+		return []responsesStreamEvent{
+			{name: "response.function_call_arguments.delta", data: map[string]any{"item_id": callID, "output_index": outputIndex, "delta": call.Function.Arguments}},
+			{name: "response.function_call_arguments.done", data: map[string]any{"item_id": callID, "output_index": outputIndex, "name": call.Function.Name, "arguments": call.Function.Arguments}},
+		}
+	}
+}
+
 func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]any {
 	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
 	if toolTypes[toolKey] == "tool_search" {
@@ -3250,7 +3864,7 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 	}
 	if toolTypes[toolKey] == "custom" {
 		item := map[string]any{
-			"id":      callID,
+			"id":      responsesCustomToolItemID(callID),
 			"type":    "custom_tool_call",
 			"status":  status,
 			"call_id": callID,
@@ -3346,7 +3960,22 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		content:      text,
 		finishReason: "stop",
 	}
-	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.RequiredArgsByTool(policy.tools))
+	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.ContractsFor(policy.tools))
+	if len(simulated.ToolCalls) == 0 {
+		candidate := text
+		if simulated.HasPayload {
+			candidate = simulated.Content
+		}
+		if call, ok := toolcalling.GrammarBodyCall(candidate, policy.tools, policy.allows); ok {
+			simulated.HasPayload = true
+			simulated.FinishReason = "tool_calls"
+			simulated.Content = ""
+			simulated.ToolCalls = []toolcalling.ToolCall{call}
+		}
+	}
+	if !policy.required {
+		simulated = dropSettledToolCalls(policy.ledger, "", simulated)
+	}
 	if simulated.HasPayload {
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
@@ -3768,6 +4397,9 @@ func (api *APIServer) fimToChat(prompt, suffix string) []payload.Message {
 
 // tokenEncoder is the tiktoken encoder for cl100k_base (GPT-4/5 family).
 var tokenEncoder *tiktoken.Tiktoken
+var tokenEncodingName string
+
+const usageSourceHeuristic = "heuristic_character_estimate"
 
 func init() {
 	enc, err := tiktoken.EncodingForModel("gpt-4")
@@ -3778,6 +4410,16 @@ func init() {
 		}
 	}
 	tokenEncoder = enc
+	if enc != nil {
+		tokenEncodingName = "cl100k_base"
+	}
+}
+
+func usageSource() string {
+	if tokenEncoder == nil {
+		return usageSourceHeuristic
+	}
+	return "tiktoken_" + tokenEncodingName + "_estimate"
 }
 
 // countTokens returns the real BPE token count using tiktoken.
@@ -3789,6 +4431,43 @@ func countTokens(text string) int {
 		return len(tokenEncoder.Encode(text, nil, nil))
 	}
 	return len(strings.Split(text, " "))
+}
+
+const (
+	requestProtocolTokens    = 4
+	messageProtocolTokens    = 4
+	toolProtocolTokens       = 6
+	toolChoiceProtocolTokens = 2
+	replyPrimingTokens       = 3
+	outputProtocolTokens     = 3
+)
+
+func countPromptTokens(messages []payload.Message, tools []toolcalling.ToolDef, toolChoice string) int {
+	total := requestProtocolTokens + replyPrimingTokens
+	for i := range messages {
+		total += messageProtocolTokens + countTokens(messages[i].Role) + countTokens(messages[i].Content)
+	}
+	for i := range tools {
+		total += toolProtocolTokens
+		if encoded, err := json.Marshal(tools[i]); err == nil {
+			total += countTokens(string(encoded))
+		}
+	}
+	if len(tools) > 0 && strings.TrimSpace(toolChoice) != "" {
+		total += toolChoiceProtocolTokens
+	}
+	return total
+}
+
+func openAIUsage(messages []payload.Message, tools []toolcalling.ToolDef, toolChoice, answer, thinking string) map[string]any {
+	promptTokens := countPromptTokens(messages, tools, toolChoice)
+	completionTokens := countTokens(answer) + outputProtocolTokens
+	reasoningTokens := countTokens(thinking)
+	return map[string]any{"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "reasoning_tokens": reasoningTokens, "total_tokens": promptTokens + completionTokens + reasoningTokens, "usage_source": usageSource()}
+}
+
+func anthropicUsage(messages []payload.Message, tools []toolcalling.ToolDef, toolChoice, answer, thinking string) map[string]any {
+	return map[string]any{"input_tokens": countPromptTokens(messages, tools, toolChoice), "output_tokens": countTokens(answer) + outputProtocolTokens, "reasoning_tokens": countTokens(thinking), "usage_source": usageSource()}
 }
 
 // truncateToTokens truncates text to at most maxTokens tokens using tiktoken.
@@ -3849,6 +4528,48 @@ type responsesRequest struct {
 	SessionID          string                `json:"session_id"`
 	User               string                `json:"user"`
 	Metadata           map[string]any        `json:"metadata"`
+	Reasoning          *responsesReasoning   `json:"reasoning"`
+}
+
+type responsesReasoning struct {
+	Effort  string `json:"effort"`
+	Summary string `json:"summary"`
+}
+
+var reasoningEffortRank = map[string]int{
+	"none": 0, "minimal": 1, "low": 2, "medium": 3,
+	"high": 4, "xhigh": 5, "max": 6,
+}
+
+func reasoningEffortRequestsDeliberation(reasoning *responsesReasoning) (bool, error) {
+	if reasoning == nil {
+		return false, nil
+	}
+	effort := strings.ToLower(strings.TrimSpace(reasoning.Effort))
+	if effort == "" {
+		return false, nil
+	}
+	rank, ok := reasoningEffortRank[effort]
+	if !ok {
+		return false, fmt.Errorf("unsupported reasoning effort %q; use %s", reasoning.Effort, strings.Join(models.ReasoningEffortNames(), ", "))
+	}
+	return rank >= reasoningEffortRank["medium"], nil
+}
+
+func applyReasoningEffort(modelKey string, cfg models.ModelConfig, deliberate bool) models.ModelConfig {
+	if !deliberate {
+		return cfg
+	}
+	for _, key := range models.RegistryKeysFor(modelKey) {
+		if strings.HasSuffix(key, "-reasoning") {
+			return cfg
+		}
+		if variant, ok := models.ModelRegistry[key+"-reasoning"]; ok {
+			logging.Infof("applyReasoningEffort: routing %s to %s-reasoning", modelKey, key)
+			return variant
+		}
+	}
+	return cfg
 }
 
 // handleResponses handles OpenAI Responses API requests.
@@ -3882,6 +4603,12 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
+	deliberate, err := reasoningEffortRequestsDeliberation(req.Reasoning)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
 
 	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
 	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
@@ -3895,6 +4622,20 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// Convert Responses API input to payload.Message list
 	messages := responsesInputToMessages(req.Input)
+	if strings.TrimSpace(req.Instructions) == "" && responsesInputIsEmpty(messages) {
+		api.respondResponsesProbe(w, cfg.OpenAIID, req.Stream)
+		return
+	}
+	if err := validateToolResultMessages(messages); err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ledger := buildToolLedger(messages)
+	if api.exceededToolRoundLimit(ledger) {
+		api.sendToolRoundLimitError(w, ledger)
+		return
+	}
+	toolPolicy.ledger = ledger
 
 	// Prepend instructions as first user message (M365 has no system role)
 	if strings.TrimSpace(req.Instructions) != "" && len(messages) > 0 {
@@ -3908,7 +4649,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// Inject one Responses-aware simulation prompt unless tool_choice disables
 	// client tool use.
 	if toolPolicy.simulate {
-		injectSimulatedPromptResponses(&messages, requestJSON, toolPolicy.promptChoice)
+		injectSimulatedPromptResponses(&messages, requestJSON, toolPolicy.promptChoice, toolPolicy.ledger.EvidenceNote())
 	}
 
 	// Resolve session ID
@@ -3944,11 +4685,12 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(r, &messages, convID)
+	goalOpen := responsesGoalContinuationOpen(req.Input)
 
 	if len(localTools) > 0 {
 		result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, sid, convID, req.Tools, localTools)
 		if err != nil {
-			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Response failed: %v", err))
+			api.sendUpstreamError(w, "response", err)
 			return
 		}
 		api.respondBufferedResponses(
@@ -3960,6 +4702,9 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 			req.MaxOutputTokens,
 			req.Stream,
 			responsesToolTypes(toolPolicy.tools),
+			goalOpen,
+			toolPolicy.tools,
+			toolPolicy.promptChoice,
 		)
 		return
 	}
@@ -3973,6 +4718,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 			convID,
 			req.MaxOutputTokens,
 			toolPolicy,
+			goalOpen,
 		)
 	} else {
 		api.nonStreamResponses(
@@ -3984,6 +4730,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 			convID,
 			req.MaxOutputTokens,
 			toolPolicy,
+			goalOpen,
 		)
 	}
 }
@@ -4014,6 +4761,25 @@ func responsesInputToMessages(input any) []payload.Message {
 		}
 
 		itemType, _ := m["type"].(string)
+
+		if itemType == "function_call_progress" {
+			callID, _ := m["call_id"].(string)
+			message, _ := m["message"].(string)
+			if strings.TrimSpace(callID) == "" || strings.TrimSpace(message) == "" {
+				logging.Debugf("responsesInputToMessages: dropping a function_call_progress item without call_id or message")
+				continue
+			}
+			phase, _ := m["phase"].(string)
+			if phase == "" {
+				phase = "running"
+			}
+			text := fmt.Sprintf("[Tool Progress (call_id: %s, phase: %s)]\n%s", callID, phase, message)
+			if output, _ := m["output"].(string); output != "" {
+				text += "\n" + output
+			}
+			messages = append(messages, payload.Message{Role: "user", Content: text, ToolProgress: true})
+			continue
+		}
 
 		// Handle function_call_output items (tool results)
 		if itemType == "function_call_output" {
@@ -4150,6 +4916,129 @@ func responsesInputToMessages(input any) []payload.Message {
 	return messages
 }
 
+func responsesInputIsEmpty(messages []payload.Message) bool {
+	for i := range messages {
+		message := &messages[i]
+		if strings.TrimSpace(message.Content) != "" {
+			return false
+		}
+		if len(message.Images) > 0 || len(message.ToolCalls) > 0 || len(message.ToolResults) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (api *APIServer) respondResponsesProbe(w http.ResponseWriter, model string, stream bool) {
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	response := buildResponsesObject(responseID, model, "", "", nil, nil, false, "stop", 0, 0, 0)
+	if !stream {
+		api.sendJSON(w, http.StatusOK, response)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return
+	}
+	sequenceNumber := 0
+	sendEvent := func(eventType string) {
+		data := map[string]any{"type": eventType, "sequence_number": sequenceNumber, "response": response}
+		sequenceNumber++
+		encoded, _ := json.Marshal(data)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", encoded)
+		flusher.Flush()
+	}
+	sendEvent("response.created")
+	sendEvent("response.in_progress")
+	sendEvent("response.completed")
+}
+
+const goalContextMarker = `<codex_internal_context source="goal">`
+const updateGoalToolName = "update_goal"
+
+func responsesGoalContinuationOpen(input any) bool {
+	items, ok := input.([]any)
+	if !ok {
+		return false
+	}
+
+	goalItem := -1
+	for index, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok || record["role"] != "user" {
+			continue
+		}
+		if strings.Contains(responsesExtractContent(record["content"]), goalContextMarker) {
+			goalItem = index
+		} else {
+			goalItem = -1
+		}
+	}
+	if goalItem < 0 {
+		return false
+	}
+
+	rest := items[goalItem+1:]
+	updateGoalCalls := map[string]bool{}
+	for _, item := range rest {
+		record, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch itemType, _ := record["type"].(string); itemType {
+		case "function_call", "custom_tool_call":
+		default:
+			continue
+		}
+		name, _ := record["name"].(string)
+		callID, _ := record["call_id"].(string)
+		if name == updateGoalToolName && callID != "" {
+			updateGoalCalls[callID] = true
+		}
+	}
+
+	for _, item := range rest {
+		record, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch itemType, _ := record["type"].(string); itemType {
+		case "function_call_output", "custom_tool_call_output":
+		default:
+			continue
+		}
+		callID, _ := record["call_id"].(string)
+		if !updateGoalCalls[callID] {
+			continue
+		}
+		output, _ := record["output"].(string)
+		var report struct {
+			Goal struct {
+				Status string `json:"status"`
+			} `json:"goal"`
+		}
+		if json.Unmarshal([]byte(output), &report) != nil {
+			continue
+		}
+		if report.Goal.Status == "complete" || report.Goal.Status == "blocked" {
+			return false
+		}
+	}
+	return true
+}
+
+func responsesMessagePhase(goalOpen bool, toolCalls []client.ToolCall) string {
+	if len(toolCalls) > 0 || goalOpen {
+		return "commentary"
+	}
+	return "final_answer"
+}
+
 // responsesExtractContent extracts text from a content field that may be a
 // string or an array of content parts (input_text, output_text, text types).
 func responsesExtractContent(content any) string {
@@ -4223,7 +5112,10 @@ func imageDataFromImageURL(urlValue string) *payload.ImageData {
 		return payload.ParseDataURL(urlValue)
 	}
 	if strings.HasPrefix(urlValue, "http://") || strings.HasPrefix(urlValue, "https://") {
-		return imageDataFromHTTPURL(urlValue)
+		// Preserve caller-supplied URLs for the common remote-image resolver.
+		// That path enforces HTTPS, public-address checks, size/count limits,
+		// content-type validation, and a bounded timeout before upload.
+		return &payload.ImageData{RemoteURL: urlValue}
 	}
 	// Local file path on the server (used by clients that pass file paths).
 	return imageDataFromLocalPath(urlValue)
@@ -4277,7 +5169,7 @@ func imageDataFromHTTPURL(rawURL string) *payload.ImageData {
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
-func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, toolTypes map[string]string, finishReason string, promptTok, completionTok, reasoningTok int) map[string]any {
+func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, toolTypes map[string]string, goalOpen bool, finishReason string, promptTok, completionTok, reasoningTok int) map[string]any {
 	status := "completed"
 	if finishReason == "length" {
 		status = "incomplete"
@@ -4306,10 +5198,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	// Add message item with output_text (only if there is text content)
 	if text != "" || len(toolCalls) == 0 {
 		msgID := fmt.Sprintf("msg_%s", responseID)
-		phase := "final_answer"
-		if len(toolCalls) > 0 {
-			phase = "commentary"
-		}
+		phase := responsesMessagePhase(goalOpen, toolCalls)
 		output = append(output, map[string]any{
 			"id":     msgID,
 			"type":   "message",
@@ -4350,12 +5239,13 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 			"output_tokens":    completionTok,
 			"reasoning_tokens": reasoningTok,
 			"total_tokens":     promptTok + completionTok + reasoningTok,
+			"usage_source":     usageSource(),
 		},
 	}
 	return resp
 }
 
-func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string) {
+func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string, goalOpen bool, tools []toolcalling.ToolDef, toolChoice string) {
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
 			result.text, result.finishReason = truncated, "length"
@@ -4365,7 +5255,7 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 		api.ctxCache.Set("session:"+sid, result.conversationID)
 	}
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
-	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, toolTypes, result.finishReason, countTokens(fmt.Sprint(messages)), countTokens(result.text), countTokens(result.thinking))
+	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, toolTypes, goalOpen, result.finishReason, countPromptTokens(messages, tools, toolChoice), countTokens(result.text)+outputProtocolTokens, countTokens(result.thinking))
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
 		return
@@ -4461,6 +5351,7 @@ func (api *APIServer) nonStreamResponses(
 	sid, convID string,
 	maxTokens int,
 	toolPolicy responsesToolPolicy,
+	goalOpen bool,
 ) {
 	result, err := api.responsesConversation(
 		ctx,
@@ -4481,7 +5372,7 @@ func (api *APIServer) nonStreamResponses(
 		if api.responsesRequestCanceled(ctx, sid) {
 			return
 		}
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+		api.sendUpstreamError(w, "chat", err)
 		return
 	}
 	respText := result.text
@@ -4575,6 +5466,7 @@ func (api *APIServer) nonStreamResponses(
 		finishReason = simulated.finishReason
 	}
 	thinking = responsesReasoningForOutput(thinking, toolPolicy.simulate)
+	respText = withoutUnverifiedCompletionClaim(respText, toolPolicy.simulate, toolPolicy.ledger, toolCalls)
 	if responsesResultEmpty(respText, toolCalls) {
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
@@ -4602,7 +5494,7 @@ func (api *APIServer) nonStreamResponses(
 	reasoningTok := countTokens(thinking)
 
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
-	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
+	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 
 	api.sendJSON(w, http.StatusOK, response)
 
@@ -4625,6 +5517,7 @@ func (api *APIServer) streamResponses(
 	sid, convID string,
 	maxTokens int,
 	toolPolicy responsesToolPolicy,
+	goalOpen bool,
 ) {
 	m365 := api.accountClientFrom(reqAccountFromContext(ctx))
 	oid, tid := api.accountOIDTIDFrom(reqAccountFromContext(ctx))
@@ -4755,7 +5648,7 @@ func (api *APIServer) streamResponses(
 					"type":    "message",
 					"status":  "in_progress",
 					"role":    "assistant",
-					"phase":   "commentary",
+					"phase":   responsesMessagePhase(goalOpen, nil),
 					"content": []any{},
 				},
 			})
@@ -4817,16 +5710,26 @@ func (api *APIServer) streamResponses(
 	}
 
 	var finalConvID string
-	for chunk := range ch {
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, func() error {
+			return writeSSEKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			sendFailed("upstream_error", chunk.Error.Error())
+			_, code, message := streamErrorFields("responses", chunk.Error)
+			sendFailed(code, message)
 			return
 		}
 
 		if chunk.IsFinal {
+			api.noteThrottling(chunk.Throttling)
 			finalConvID = chunk.ConversationID
 			break
 		}
@@ -4869,7 +5772,7 @@ func (api *APIServer) streamResponses(
 							"type":    "message",
 							"status":  "in_progress",
 							"role":    "assistant",
-							"phase":   "final_answer",
+							"phase":   responsesMessagePhase(goalOpen, nil),
 							"content": []any{},
 						},
 					})
@@ -5069,6 +5972,7 @@ func (api *APIServer) streamResponses(
 		fullText = simulated.content
 		toolCalls = simulated.toolCalls
 		finishReason = simulated.finishReason
+		warnOnUnverifiedCompletionClaim(fullText, toolPolicy.simulate, toolPolicy.ledger, len(toolCalls))
 		if truncated {
 			finishReason = "length"
 		}
@@ -5225,30 +6129,9 @@ func (api *APIServer) streamResponses(
 			})
 			isCustom := toolTypes[toolKey] == "custom"
 			if !isToolSearch {
-				if isCustom {
-					sendEvent("response.custom_tool_call_input.delta", map[string]any{
-						"item_id":      callID,
-						"output_index": outputIdx,
-						"delta":        tc.Function.Arguments,
-					})
-					sendEvent("response.custom_tool_call_input.done", map[string]any{
-						"item_id":      callID,
-						"output_index": outputIdx,
-						"input":        extractCustomToolInput(tc.Function.Arguments),
-						"name":         tc.Function.Name,
-					})
-				} else {
-					sendEvent("response.function_call_arguments.delta", map[string]any{
-						"item_id":      callID,
-						"output_index": outputIdx,
-						"delta":        tc.Function.Arguments,
-					})
-					sendEvent("response.function_call_arguments.done", map[string]any{
-						"item_id":      callID,
-						"output_index": outputIdx,
-						"name":         tc.Function.Name,
-						"arguments":    tc.Function.Arguments,
-					})
+				_ = isCustom
+				for _, event := range responsesToolInputEvents(callID, tc, toolTypes, outputIdx) {
+					sendEvent(event.name, event.data)
 				}
 			}
 			sendEvent("response.output_item.done", map[string]any{
@@ -5315,7 +6198,7 @@ func (api *APIServer) streamResponses(
 	reasoningText := thinkingText.String()
 	reasoningTok := countTokens(reasoningText)
 
-	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
 	sendEvent("response.completed", map[string]any{
@@ -5491,15 +6374,17 @@ func (api *APIServer) nonStreamResponsesCompact(r *http.Request, w http.Response
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Compaction failed: %v", err))
+		api.sendUpstreamError(w, "compaction", err)
 		return
 	}
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		if sim.HasPayload {
 			respText = sim.Content
+		} else {
+			respText = toolcalling.WithholdTransportEnvelope(respText)
 		}
 	}
 
@@ -5580,19 +6465,27 @@ func (api *APIServer) streamResponsesCompact(r *http.Request, w http.ResponseWri
 	fullText := ""
 
 	var finalToolCalls []client.ToolCall
-	for chunk := range ch {
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(r.Context(), ch, keepalive, w, func() error {
+			return writeSSEKeepalive(w, flusher)
+		})
+		if !more {
+			break
+		}
 		if chunk.Error != nil {
-			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
+			_, code, message := streamErrorFields("compaction", chunk.Error)
 			sendEvent("response.failed", map[string]any{
 				"response": map[string]any{
 					"id":     responseID,
 					"object": "response",
 					"status": "failed",
 					"model":  openaiModel,
-					"error":  map[string]any{"message": chunk.Error.Error()},
+					"error":  map[string]any{"code": code, "message": message},
 				},
 			})
 			fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -5607,9 +6500,11 @@ func (api *APIServer) streamResponsesCompact(r *http.Request, w http.ResponseWri
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
 		if sim.HasPayload {
 			fullText = sim.Content
+		} else {
+			fullText = toolcalling.WithholdTransportEnvelope(fullText)
 		}
 	}
 
@@ -5678,7 +6573,7 @@ type imageDataItem struct {
 }
 
 // urlImagePattern matches markdown image links with HTTP(S) URLs.
-var urlImagePattern = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^)]+)\)`)
+var urlImagePattern = regexp.MustCompile(`!\[[^\]]*\]\((https://[^)]+)\)`)
 
 // handleImageGenerations handles OpenAI /v1/images/generations requests.
 // It wraps the prompt as a chat completions request to M365, extracts generated
@@ -5731,7 +6626,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	// cause M365 to disengage instead of routing the prompt to image generation.
 	respText, _, _, _, _, err := m365.ChatConversation(messages, cfg.Tone, cfg.Override, "", oid, tid, false)
 	if err != nil {
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image generation failed: %v", err))
+		api.sendUpstreamError(w, "image generation", err)
 		return
 	}
 
@@ -5902,7 +6797,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 
 	respText, _, _, _, finalConvID, err := m365.ChatConversation(messages, cfg.Tone, cfg.Override, convID, oid, tid, false)
 	if err != nil {
-		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image edit failed: %v", err))
+		api.sendUpstreamError(w, "image edit", err)
 		return
 	}
 
@@ -5974,6 +6869,10 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 	var items []imageDataItem
 	for _, u := range uniqueURLs {
 		if responseFormat == "b64_json" {
+			if err := api.validateImageDownloadURL(u); err != nil {
+				logging.Warnf("Ignoring disallowed generated-image download URL: %v", err)
+				continue
+			}
 			b64, err := api.downloadAndBase64(u)
 			if err != nil {
 				logging.Errorf("Failed to download image %s: %v", u, err)
@@ -6001,11 +6900,58 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 	return items
 }
 
+var errImageHostNotAllowed = errors.New("image URL host is not allowed")
+
+func hostAllowed(host string, allowlist []string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, entry := range allowlist {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if domain, isSuffix := strings.CutPrefix(entry, "."); isSuffix {
+			if host == domain || strings.HasSuffix(host, entry) {
+				return true
+			}
+			continue
+		}
+		if host == entry {
+			return true
+		}
+	}
+	return false
+}
+
+func (api *APIServer) validateImageDownloadURL(rawURL string) error {
+	parsed, err := neturl.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid URL: %v", errImageHostNotAllowed, err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("%w: scheme %q is not https", errImageHostNotAllowed, parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("%w: URL has no host", errImageHostNotAllowed)
+	}
+	if api.config == nil || !hostAllowed(host, api.config.ImageHostAllowlist) {
+		return fmt.Errorf("%w: %q", errImageHostNotAllowed, host)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return fmt.Errorf("%w: %q does not resolve", errImageHostNotAllowed, host)
+	}
+	if slices.ContainsFunc(ips, ipDisallowed) {
+		return fmt.Errorf("%w: %q resolves to a non-public address", errImageHostNotAllowed, host)
+	}
+	return nil
+}
+
 // downloadAndBase64 downloads an image from a designerapp URL and returns its
 // base64-encoded content. designerapp URLs require a JWE access token (acquired
 // via SSO cookies with the M365 web app client_id) and the fileToken query
 // parameter sent as a header.
 func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
+	if err := api.validateImageDownloadURL(imageURL); err != nil {
+		return "", err
+	}
 	logging.Infof("downloadAndBase64: downloading image from %s", imageURL[:min(100, len(imageURL))])
 	parsedURL, err := neturl.Parse(imageURL)
 	if err != nil {

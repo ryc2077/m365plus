@@ -18,6 +18,12 @@ import (
 	"github.com/ryc2077/m365plus/pkg/logging"
 )
 
+// webSearchInstruction states how a declared web_search tool is handled. M365
+// runs the search itself through the BingWebSearch built-in, so the client has
+// nothing to execute and a call to it would stall the turn.
+const webSearchInstruction = "If a tool named web_search is declared, do not emit a call to it. " +
+	"Web search runs on this side; put the search results directly into your answer text."
+
 // BuildSimulatedPrompt constructs the prompt sent to M365 Copilot in simulated
 // mode. It embeds the full OpenAI request JSON and instructs the model to
 // return a single ```json block containing a valid chat.completion response.
@@ -25,7 +31,8 @@ import (
 // requestJSON is the serialized OpenAI /v1/chat/completions request body.
 // hasTools indicates whether the request carries client-defined tools.
 // toolChoice is the raw tool_choice value ("auto", "required", "none", or "").
-func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) string {
+// evidence is the tool result summary from Ledger.EvidenceNote, or "".
+func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice, evidence string) string {
 	lines := []string{
 		"The JSON payload below is an entire request for the OpenAI chat.completions format.",
 		"The JSON payload below is an entire request for POST /v1/chat/completions.",
@@ -44,7 +51,9 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 			"Every tool call MUST include all properties listed in that tool's parameters.required array, each with a concrete non-empty value inferred from the request; never emit a tool call with a missing or empty required field.",
 			"CRITICAL: Only use tool names that appear in the tools array of the request payload. Never invent tool names.",
 			"NEVER emit a tool_calls entry with name \"code_interpreter\" or any name not present in the request's tools array.",
-			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
+			"Do not use code_interpreter or any built-in/baked-in tool. Only the client-supplied tools are valid.",
+			webSearchInstruction,
+			nativeToolBanInstruction,
 		)
 		normalizedChoice := strings.TrimSpace(toolChoice)
 		switch strings.ToLower(normalizedChoice) {
@@ -56,6 +65,10 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 		}
 	}
 
+	if evidence != "" {
+		lines = append(lines, evidence)
+	}
+
 	lines = append(lines, "```json", requestJSON, "```")
 	return strings.Join(lines, "\n")
 }
@@ -64,7 +77,9 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 // OpenAI Responses API requests. The embedded request keeps Responses input
 // semantics, while the model returns the existing chat-completion-shaped inner
 // result envelope consumed by ParseSimulatedResponse.
-func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice string) string {
+//
+// evidence is the tool result summary from Ledger.EvidenceNote, or "".
+func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice, evidence string) string {
 	lines := []string{
 		"The JSON payload below is an entire request for the OpenAI Responses API.",
 		"The JSON payload below is an entire request for POST /v1/responses.",
@@ -89,16 +104,10 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 			`For a function inside a "type": "namespace" tool, keep the short function name and copy the enclosing namespace name into the tool call's "namespace" field.`,
 			"CRITICAL: Only use tool names that appear in the tools array or in a prior tool_search_output item. Never invent tool names.",
 			`A tool entry with "type": "tool_search" is callable as "tool_search" and can load additional tools when needed.`,
-			"Do not use code_interpreter, web_search, or another built-in tool unless its exact name is in the callable set.",
+			"Do not use code_interpreter or another built-in tool unless its exact name is in the callable set.",
+			webSearchInstruction,
+			nativeToolBanInstruction,
 		)
-
-		if strings.Contains(requestJSON, `"type":"custom"`) {
-			lines = append(lines,
-				`A tool entry with "type": "custom" is a freeform JavaScript tool: its arguments value must be raw JS source text (not a JSON object), such as "await tools.exec_command({cmd: 'pwd'});".`,
-				`For a "type": "custom" freeform tool, always surface the nested tool's result through the global text(...) helper so the caller receives it. Capture the awaited return value and emit it, e.g. "const r = await tools.exec_command({cmd: 'pwd'}); text(r.output);". A bare "await tools.exec_command(...)" discards the returned output.`,
-				`Prefer the custom tool's nested functions (documented on the tools object, e.g. tools.exec_command) over top-level JSON-schema tools when the custom tool exposes a matching capability.`,
-			)
-		}
 
 		normalizedChoice := strings.TrimSpace(toolChoice)
 		switch strings.ToLower(normalizedChoice) {
@@ -109,6 +118,10 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 		default:
 			lines = append(lines, fmt.Sprintf("This request requires the specific tool %q. Do not call any other tool and do not return a plain-text-only assistant response.", normalizedChoice))
 		}
+	}
+
+	if evidence != "" {
+		lines = append(lines, evidence)
 	}
 
 	lines = append(lines, "```json", requestJSON, "```")
@@ -123,7 +136,8 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 // requestJSON is the serialized Anthropic /v1/messages request body.
 // hasTools indicates whether the request carries client-defined tools.
 // toolChoice is the Anthropic tool_choice value ("any", "auto", "tool", or "").
-func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice string) string {
+// evidence is the tool result summary from Ledger.EvidenceNote, or "".
+func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice, evidence string) string {
 	lines := []string{
 		"The JSON payload below is an entire request for the Anthropic Messages API format.",
 		"The JSON payload below is an entire request for POST /v1/messages.",
@@ -142,7 +156,9 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 			"Every tool_use block MUST include all properties listed in that tool's input_schema.required array, each with a concrete non-empty value inferred from the request; never emit a tool_use block with a missing or empty required field.",
 			"CRITICAL: Only use tool names that appear in the tools array of the request payload. Never invent tool names.",
 			"NEVER emit a tool_use block with name \"code_interpreter\" or any name not present in the request's tools array.",
-			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
+			"Do not use code_interpreter or any built-in/baked-in tool. Only the client-supplied tools are valid.",
+			webSearchInstruction,
+			nativeToolBanInstruction,
 		)
 		switch strings.ToLower(strings.TrimSpace(toolChoice)) {
 		case "any":
@@ -150,6 +166,10 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 		case "tool":
 			lines = append(lines, "This request requires a specific tool call. Do not return a plain-text-only assistant response.")
 		}
+	}
+
+	if evidence != "" {
+		lines = append(lines, evidence)
 	}
 
 	lines = append(lines, "```json", requestJSON, "```")
@@ -216,31 +236,34 @@ func requiredFromSchema(schema map[string]any) []string {
 }
 
 // BuildRepairNote constructs a corrective instruction appended to the simulated
-// request when the first attempt produced tool calls that omitted schema-required
-// arguments. It names each offending tool and the exact fields that must be
-// populated so the backend re-emits an executable tool call on the next attempt.
-func BuildRepairNote(droppedTools []string, requiredByTool map[string][]string) string {
-	seen := make(map[string]bool, len(droppedTools))
+// request when the first attempt produced tool calls that failed validation. It
+// names each offending tool, the reason it was rejected, and the fields that
+// must be populated, so the backend re-emits an executable tool call.
+func BuildRepairNote(dropped []DroppedCall, contracts ToolContracts) string {
+	seen := make(map[string]bool, len(dropped))
 	var clauses []string
-	for _, name := range droppedTools {
-		if name == "" || seen[name] {
+	for _, call := range dropped {
+		if call.Name == "" || seen[call.Name] {
 			continue
 		}
-		seen[name] = true
-		if required := requiredByTool[name]; len(required) > 0 {
-			clauses = append(clauses, fmt.Sprintf("%q (required: %s)", name, strings.Join(required, ", ")))
-		} else {
-			clauses = append(clauses, fmt.Sprintf("%q", name))
+		seen[call.Name] = true
+		clause := fmt.Sprintf("%q", call.Name)
+		if call.Reason != "" {
+			clause += fmt.Sprintf(" (rejected: %s)", call.Reason)
 		}
+		if required := contracts.Required[call.Name]; len(required) > 0 {
+			clause += fmt.Sprintf(" (required: %s)", strings.Join(required, ", "))
+		}
+		clauses = append(clauses, clause)
 	}
 	target := "the tool call"
 	if len(clauses) > 0 {
 		target = strings.Join(clauses, "; ")
 	}
-	return "RETRY: Your previous tool call was rejected because required arguments were missing or empty. " +
+	return "RETRY: Your previous tool call was rejected because it did not satisfy the tool schema. " +
 		"Re-emit the JSON envelope with a tool call for " + target + ". " +
 		"Every required field MUST be present and filled with a concrete, non-empty value inferred from the request. " +
-		"Do not omit any required field and do not leave any required field as an empty string or null."
+		"Match every declared type and allowed value exactly, and do not invent arguments the schema does not declare."
 }
 
 // toolCallSatisfiesRequired reports whether the tool call arguments contain
@@ -274,10 +297,39 @@ type SimulatedResult struct {
 	ToolCalls    []ToolCall // parsed tool calls
 	FinishReason string     // "tool_calls" or "stop"
 	HasPayload   bool       // true if a usable chat-completion payload was found
-	// DroppedMissingArgs lists the names of tool calls that were dropped because
-	// they omitted schema-required arguments. Callers use this signal to trigger
-	// a single corrective re-ask instead of returning an empty turn.
-	DroppedMissingArgs []string
+	// DroppedCalls lists the tool calls that failed validation and were dropped.
+	// Callers use this signal to trigger a single corrective re-ask instead of
+	// returning an empty turn, and each reason tells the model what to fix.
+	DroppedCalls []DroppedCall
+}
+
+// DroppedMissingArgs preserves compatibility with callers that only need the
+// names of repairable calls rejected by the richer contract validator.
+func (r SimulatedResult) DroppedMissingArgs() []string {
+	return r.DroppedNames()
+}
+
+// DroppedCall records a tool call the parser refused to forward.
+type DroppedCall struct {
+	// Name is the tool the model tried to call.
+	Name string
+	// Reason states why the call was rejected, in wording safe to show the model.
+	Reason string
+}
+
+// DroppedNames returns the distinct tool names in DroppedCalls, preserving the
+// order they were dropped in.
+func (r SimulatedResult) DroppedNames() []string {
+	seen := make(map[string]bool, len(r.DroppedCalls))
+	names := make([]string, 0, len(r.DroppedCalls))
+	for _, dropped := range r.DroppedCalls {
+		if dropped.Name == "" || seen[dropped.Name] {
+			continue
+		}
+		seen[dropped.Name] = true
+		names = append(names, dropped.Name)
+	}
+	return names
 }
 
 // ParseSimulatedResponse extracts a simulated OpenAI chat completion response
@@ -289,17 +341,17 @@ type SimulatedResult struct {
 // tool call whose name is NOT in this set (e.g. M365-invented "code_interpreter")
 // is silently dropped. If all tool calls are dropped, the response is treated as
 // a plain content response. Pass nil to disable filtering (not recommended).
-func ParseSimulatedResponse(text string, allowedToolNames []string, requiredByTool map[string][]string) SimulatedResult {
-	return parseSimulatedResponse(text, allowedToolNames, requiredByTool, false)
+func ParseSimulatedResponse(text string, allowedToolNames []string, contracts ToolContracts) SimulatedResult {
+	return parseSimulatedResponse(text, allowedToolNames, contracts, false)
 }
 
 // ParseSimulatedResponseResponses preserves assistant content alongside valid
 // tool calls so Responses clients can display a commentary preamble.
-func ParseSimulatedResponseResponses(text string, allowedToolNames []string, requiredByTool map[string][]string) SimulatedResult {
-	return parseSimulatedResponse(text, allowedToolNames, requiredByTool, true)
+func ParseSimulatedResponseResponses(text string, allowedToolNames []string, contracts ToolContracts) SimulatedResult {
+	return parseSimulatedResponse(text, allowedToolNames, contracts, true)
 }
 
-func parseSimulatedResponse(text string, allowedToolNames []string, requiredByTool map[string][]string, preserveToolContent bool) SimulatedResult {
+func parseSimulatedResponse(text string, allowedToolNames []string, contracts ToolContracts, preserveToolContent bool) SimulatedResult {
 	allowed := make(map[string]bool, len(allowedToolNames))
 	for _, n := range allowedToolNames {
 		allowed[strings.TrimSpace(n)] = true
@@ -332,7 +384,7 @@ func parseSimulatedResponse(text string, allowedToolNames []string, requiredByTo
 	}
 
 	result.HasPayload = true
-	parseChatCompletionPayload(best, &result, allowed, requiredByTool, preserveToolContent)
+	parseChatCompletionPayload(best, &result, allowed, contracts, preserveToolContent)
 	if len(result.ToolCalls) > 0 {
 		logging.Infof("ParseSimulatedResponse: parsed %d tool calls", len(result.ToolCalls))
 	} else if result.Content != "" {
@@ -348,7 +400,7 @@ func parseSimulatedResponse(text string, allowedToolNames []string, requiredByTo
 //
 // allowedToolNames is the set of tool names the client actually declared. Any
 // tool_use block whose name is NOT in this set is silently dropped.
-func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, requiredByTool map[string][]string) SimulatedResult {
+func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, contracts ToolContracts) SimulatedResult {
 	allowed := make(map[string]bool, len(allowedToolNames))
 	for _, n := range allowedToolNames {
 		allowed[strings.TrimSpace(n)] = true
@@ -378,7 +430,7 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, req
 	}
 
 	result.HasPayload = true
-	parseAnthropicPayload(best, &result, allowed, requiredByTool)
+	parseAnthropicPayload(best, &result, allowed, contracts)
 	if len(result.ToolCalls) > 0 {
 		logging.Infof("ParseSimulatedResponseAnthropic: parsed %d tool calls", len(result.ToolCalls))
 	} else if result.Content != "" {
@@ -390,7 +442,7 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, req
 // parseAnthropicPayload extracts tool_use blocks and text content from an
 // Anthropic message-shaped JSON object. Tool calls whose name is not in
 // `allowed` (when non-empty) are dropped.
-func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, requiredByTool map[string][]string) {
+func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
 	// stop_reason
 	if sr, ok := payload["stop_reason"].(string); ok && sr != "" {
 		if sr == "tool_use" {
@@ -429,10 +481,10 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 			if len(allowed) > 0 && !allowed[name] {
 				continue
 			}
-			id, _ := bm["id"].(string)
-			if id == "" {
-				id = nextToolCallID()
-			}
+			// The model's own id is discarded. It tends to be a deterministic
+			// label such as call_istanbul_weather_001, which repeats across
+			// turns and makes clients reject a duplicate tool call id.
+			id := nextToolCallID()
 			// input is a JSON object in Anthropic format
 			var argsBytes []byte
 			if input, ok := bm["input"]; ok && input != nil {
@@ -440,13 +492,17 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 			} else {
 				argsBytes = []byte("{}")
 			}
-			// Drop tool_use blocks that omit schema-required arguments so the
-			// client never receives an unexecutable tool call to retry forever.
-			if !toolCallSatisfiesRequired(json.RawMessage(argsBytes), requiredByTool[name]) {
-				logging.Warnf("parseAnthropicPayload: dropping %q tool_use missing required arguments", name)
-				result.DroppedMissingArgs = append(result.DroppedMissingArgs, name)
+			// Drop tool_use blocks that violate the tool's schema so the client
+			// never receives an unexecutable tool call to retry forever.
+			validated, reason, repairable := contracts.validate(name, json.RawMessage(argsBytes))
+			if reason != "" {
+				logging.Warnf("parseAnthropicPayload: dropping %q tool_use: %s", name, reason)
+				if repairable {
+					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+				}
 				continue
 			}
+			argsBytes = validated
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
 				ID:        id,
 				Name:      name,
@@ -520,7 +576,7 @@ func scoreAnthropicCandidate(candidate map[string]any) int {
 // chat.completion-shaped JSON object into the result. Tool calls whose name is
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
-func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, requiredByTool map[string][]string, preserveToolContent bool) {
+func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts, preserveToolContent bool) {
 	choices, ok := payload["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		return
@@ -555,14 +611,18 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 			if len(allowed) > 0 && !allowed[name] {
 				continue
 			}
-			// Drop tool calls that omit schema-required arguments so a malformed
-			// call is never forwarded to the client (which would reject it and
-			// retry in an endless loop).
-			if !toolCallSatisfiesRequired(json.RawMessage(args), requiredByTool[name]) {
-				logging.Warnf("parseChatCompletionPayload: dropping %q tool call missing required arguments", name)
-				result.DroppedMissingArgs = append(result.DroppedMissingArgs, name)
+			// Drop tool calls that violate the tool's schema so a malformed call
+			// is never forwarded to the client (which would reject it and retry
+			// in an endless loop).
+			validated, reason, repairable := contracts.validate(name, json.RawMessage(args))
+			if reason != "" {
+				logging.Warnf("parseChatCompletionPayload: dropping %q tool call: %s", name, reason)
+				if repairable {
+					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+				}
 				continue
 			}
+			args = string(validated)
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
 				ID:        id,
 				Name:      name,
@@ -587,10 +647,11 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 	result.Content = normalizeMessageContent(message["content"])
 }
 
-// extractToolCallFields pulls id/name/arguments from a tool_calls entry,
+// extractToolCallFields pulls name/namespace/arguments from a tool_calls entry,
 // tolerating both the OpenAI wrapper ({id,type,function:{name,arguments}})
 // and a flat shape ({name,arguments}).
 func extractToolCallFields(tc map[string]any) (name, namespace, id, args string) {
+	var argumentsNode any
 	if fn, ok := tc["function"].(map[string]any); ok {
 		if n, ok := fn["name"].(string); ok && n != "" {
 			name = n
@@ -598,8 +659,10 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 		if ns, ok := fn["namespace"].(string); ok && ns != "" {
 			namespace = ns
 		}
-		if i, ok := tc["id"].(string); ok && i != "" {
-			id = i
+		if value, ok := fn["arguments"]; ok {
+			argumentsNode = value
+		} else if value, ok := fn["function.arguments"]; ok {
+			argumentsNode = value
 		}
 	}
 	if name == "" {
@@ -612,33 +675,17 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 			namespace = ns
 		}
 	}
-	// Pick the first non-nil arguments source. M365 varies between the
-	// standard "arguments" key, a "function.arguments" key on the wrapper or
-	// inside the function object, and the OpenAI wrapper's function.arguments.
-	var argumentsNode any
-	if fn, ok := tc["function"].(map[string]any); ok {
-		if fa, ok := fn["arguments"]; ok {
-			argumentsNode = fa
-		} else if fa, ok := fn["function.arguments"]; ok {
-			argumentsNode = fa
-		}
-	}
 	if argumentsNode == nil {
-		if a, ok := tc["arguments"]; ok {
-			argumentsNode = a
-		} else if fa, ok := tc["function.arguments"]; ok {
-			argumentsNode = fa
+		if value, ok := tc["arguments"]; ok {
+			argumentsNode = value
+		} else if value, ok := tc["function.arguments"]; ok {
+			argumentsNode = value
 		}
 	}
 	args = normalizeArgumentsJSON(argumentsNode)
-	if id == "" {
-		if i, ok := tc["id"].(string); ok && i != "" {
-			id = i
-		}
-	}
-	if id == "" {
-		id = nextToolCallID()
-	}
+	// Always mint our own id. A model-supplied id repeats across turns, which
+	// clients reject as a duplicate tool call id.
+	id = nextToolCallID()
 	return
 }
 

@@ -4,6 +4,7 @@ package models
 
 import (
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,83 +26,143 @@ const (
 
 // ModelConfig represents the configuration for a specific model variant.
 type ModelConfig struct {
-	Tone     string // The tone/style parameter sent to the backend
-	Override string // Optional GPT model override identifier
-	OpenAIID string // OpenAI-compatible model identifier
+	Tone        string // The tone/style parameter sent to the backend
+	Override    string // Optional GPT model override identifier
+	OpenAIID    string // OpenAI-compatible model identifier
+	Owner       string
+	DisplayName string
+	Thinking    bool
+}
+
+const (
+	OwnerMicrosoft = "microsoft-365"
+	OwnerAnthropic = "anthropic-via-microsoft-365"
+)
+
+func (c ModelConfig) OwnerOrDefault() string {
+	if c.Owner != "" {
+		return c.Owner
+	}
+	return OwnerMicrosoft
+}
+
+func (c ModelConfig) DisplayNameOrDefault() string {
+	if c.DisplayName != "" {
+		return c.DisplayName
+	}
+	return c.OpenAIID
+}
+
+type ReasoningEffortPreset struct {
+	Effort      string `json:"effort"`
+	Description string `json:"description"`
+}
+
+var ReasoningEffortPresets = []ReasoningEffortPreset{
+	{Effort: "none", Description: "Disable additional reasoning."},
+	{Effort: "minimal", Description: "Fast responses with minimal reasoning."},
+	{Effort: "low", Description: "Fast responses with lighter reasoning."},
+	{Effort: "medium", Description: "Balances speed and reasoning depth."},
+	{Effort: "high", Description: "Greater reasoning depth for complex problems."},
+	{Effort: "xhigh", Description: "Extra high reasoning depth."},
+	{Effort: "max", Description: "Maximum reasoning depth."},
 }
 
 // ModelRegistry maps model keys to their configurations.
 var ModelRegistry = map[string]ModelConfig{
 	"auto": {
-		Tone:     "Magic",
-		Override: "",
-		OpenAIID: "gpt-4-auto",
+		Tone:        "Magic",
+		Override:    "",
+		OpenAIID:    "gpt-4-auto",
+		DisplayName: "GPT Auto",
 	},
 	"quick": {
-		Tone:     "Chat",
-		Override: "",
-		OpenAIID: "gpt-4-quick",
+		Tone:        "Chat",
+		Override:    "",
+		OpenAIID:    "gpt-4-quick",
+		DisplayName: "GPT Quick",
 	},
 	"reasoning": {
-		Tone:     "Magic",
-		Override: "",
-		OpenAIID: "gpt-4-reasoning",
+		Tone:        "Magic",
+		Override:    "",
+		OpenAIID:    "gpt-4-reasoning",
+		DisplayName: "GPT Reasoning",
+		Thinking:    true,
 	},
 	"gpt5.5": {
-		Tone:     "Gpt_5_5_Chat",
-		Override: "",
-		OpenAIID: "gpt-5.5",
+		Tone:        "Gpt_5_5_Chat",
+		Override:    "",
+		OpenAIID:    "gpt-5.5",
+		DisplayName: "GPT-5.5",
 	},
 	"gpt5.5-reasoning": {
-		Tone:     "Gpt_5_5_Reasoning",
-		Override: "",
-		OpenAIID: "gpt-5.5-reasoning",
+		Tone:        "Gpt_5_5_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.5-reasoning",
+		DisplayName: "GPT-5.5 Reasoning",
+		Thinking:    true,
 	},
 	"gpt5.6-reasoning": {
-		Tone:     "Gpt_5_6_Reasoning",
-		Override: "",
-		OpenAIID: "gpt-5.6-reasoning",
+		Tone:        "Gpt_5_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.6-reasoning",
+		DisplayName: "GPT-5.6 Reasoning",
+		Thinking:    true,
 	},
 	"gpt5.6-sol": {
-		Tone:     "Gpt_5_6_Reasoning",
-		Override: "",
-		OpenAIID: "gpt-5.6-sol",
+		Tone:        "Gpt_5_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.6-sol",
+		DisplayName: "GPT-5.6 Sol",
 	},
 	"gpt5.6-terra": {
-		Tone:     "Gpt_5_6_Reasoning",
-		Override: "",
-		OpenAIID: "gpt-5.6-terra",
+		Tone:        "Gpt_5_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.6-terra",
+		DisplayName: "GPT-5.6 Terra",
 	},
 	"gpt5.6-luna": {
-		Tone:     "Gpt_5_6_Reasoning",
-		Override: "",
-		OpenAIID: "gpt-5.6-luna",
+		Tone:        "Gpt_5_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.6-luna",
+		DisplayName: "GPT-5.6 Luna",
 	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
-		Tone:     "Claude_Sonnet",
-		Override: "",
-		OpenAIID: "claude-sonnet-4.6",
+		Tone:        "Claude_Sonnet",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-4.6",
+		DisplayName: "Claude Sonnet 4.6",
+		Owner:       OwnerAnthropic,
 	},
 	"claude-sonnet": {
-		Tone:     "Claude_Sonnet",
-		Override: "",
-		OpenAIID: "claude-sonnet-4.6",
+		Tone:        "Claude_Sonnet",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-4.6",
+		DisplayName: "Claude Sonnet 4.6",
+		Owner:       OwnerAnthropic,
 	},
 	"claude-opus": {
-		Tone:     "Claude_Opus",
-		Override: "",
-		OpenAIID: "claude-opus-4.6",
+		Tone:        "Claude_Opus",
+		Override:    "",
+		OpenAIID:    "claude-opus-4.6",
+		DisplayName: "Claude Opus 4.6",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
 	},
 	"claude-fable": {
-		Tone:     "Claude_Fable",
-		Override: "",
-		OpenAIID: "claude-fable-5",
+		Tone:        "Claude_Fable",
+		Override:    "",
+		OpenAIID:    "claude-fable-5",
+		DisplayName: "Claude Fable 5",
+		Owner:       OwnerAnthropic,
 	},
 	"claude-sonnet-4-20250514": {
-		Tone:     "Claude_Sonnet",
-		Override: "",
-		OpenAIID: "claude-sonnet-4.6",
+		Tone:        "Claude_Sonnet",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-4.6",
+		DisplayName: "Claude Sonnet 4.6",
+		Owner:       OwnerAnthropic,
 	},
 }
 
@@ -127,9 +188,18 @@ type Config struct {
 	CodeToolMaxOutput     int64
 	CodeToolMaxReadBytes  int64
 	CodeToolMaxIterations int
+	ImageHostAllowlist    []string
 	ContextWindowTokens   int
 	MaxOutputTokens       int
+	MaxToolRounds         int
 }
+
+const (
+	DefaultMaxToolRounds = 32
+	MaxToolRoundsCeiling = 512
+)
+
+var DefaultImageHostAllowlist = []string{".officeapps.live.com"}
 
 // LoadConfig loads configuration from .env file and environment variables.
 // Returns configuration with defaults for missing values.
@@ -150,8 +220,10 @@ func LoadConfig() *Config {
 		CodeToolMaxOutput:     getEnvInt64("M365_CODE_TOOL_MAX_OUTPUT", 1<<20),
 		CodeToolMaxReadBytes:  getEnvInt64("M365_CODE_TOOL_MAX_READ_BYTES", 1<<20),
 		CodeToolMaxIterations: getEnvInt("M365_CODE_TOOL_MAX_ITERATIONS", 10),
+		ImageHostAllowlist:    getEnvHostList("M365_IMAGE_HOST_ALLOWLIST", DefaultImageHostAllowlist),
 		ContextWindowTokens:   getEnvInt("M365_CONTEXT_WINDOW", 1_000_000),
 		MaxOutputTokens:       getEnvInt("M365_MAX_OUTPUT_TOKENS", 1_000_000),
+		MaxToolRounds:         min(getEnvInt("M365_MAX_TOOL_ROUNDS", DefaultMaxToolRounds), MaxToolRoundsCeiling),
 	}
 
 	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d", cfg.TenantID, cfg.UserOID, cfg.ClientID[:min(8, len(cfg.ClientID))]+"...", len(cfg.APIKeys))
@@ -226,12 +298,68 @@ func LookupModel(key string) ModelConfig {
 	return ModelRegistry["auto"]
 }
 
+// FindModel finds a model by registry key or advertised OpenAI ID and reports
+// whether the requested name is served by this instance.
+func FindModel(key string) (ModelConfig, bool) {
+	if cfg, ok := ModelRegistry[key]; ok {
+		return cfg, true
+	}
+	for _, cfg := range ModelRegistry {
+		if cfg.OpenAIID == key {
+			return cfg, true
+		}
+	}
+	return ModelConfig{}, false
+}
+
+// RegistryKeysFor returns registry keys matching either a key or an OpenAI ID.
+func RegistryKeysFor(model string) []string {
+	if _, ok := ModelRegistry[model]; ok {
+		return []string{model}
+	}
+	keys := make([]string, 0, 1)
+	for key, cfg := range ModelRegistry {
+		if cfg.OpenAIID == model {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// ReasoningEffortNames lists the reasoning effort values accepted by the API.
+func ReasoningEffortNames() []string {
+	names := make([]string, len(ReasoningEffortPresets))
+	for i, preset := range ReasoningEffortPresets {
+		names[i] = preset.Effort
+	}
+	return names
+}
+
 // getEnvWithDefault returns an environment variable value or a default fallback.
 func getEnvWithDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvHostList(key string, defaults []string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return append([]string(nil), defaults...)
+	}
+	hosts := make([]string, 0)
+	for host := range strings.SplitSeq(value, ",") {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	if len(hosts) == 0 {
+		return append([]string(nil), defaults...)
+	}
+	return hosts
 }
 
 // getEnvBool returns true for "true", "1", "yes", "on" (case-insensitive).

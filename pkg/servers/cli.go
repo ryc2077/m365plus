@@ -5,7 +5,10 @@ package servers
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/ryc2077/m365plus/pkg/auth"
@@ -58,19 +61,37 @@ type CLIOptions struct {
 
 // listModels prints all available models.
 func (cli *CLIServer) listModels() error {
-	fmt.Println("Available models:")
-	for key, cfg := range models.ModelRegistry {
+	PrintModels(os.Stdout)
+	return nil
+}
+
+func PrintModels(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Available models:")
+	for _, key := range slices.Sorted(maps.Keys(models.ModelRegistry)) {
+		cfg := models.ModelRegistry[key]
 		desc := cfg.Tone
 		if cfg.Override != "" {
 			desc += fmt.Sprintf(" (%s)", cfg.Override)
 		}
-		fmt.Printf("  %-12s - %s\n", key, desc)
+		_, _ = fmt.Fprintf(w, "  %-26s %-22s api id: %s\n", key, desc, cfg.OpenAIID)
 	}
-	return nil
+	_, _ = fmt.Fprintln(w, "\nThe left column is the -model name. The api id is what /v1/models advertises.")
+}
+
+func resolveCLIModel(key string) (models.ModelConfig, error) {
+	cfg, ok := models.FindModel(key)
+	if !ok {
+		return models.ModelConfig{}, fmt.Errorf("unknown model %q; run --list-models for the available keys", key)
+	}
+	return cfg, nil
 }
 
 // runInteractive starts the interactive mode.
 func (cli *CLIServer) runInteractive(options *CLIOptions) error {
+	cfg, err := resolveCLIModel(options.Model)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("M365 Copilot v%s (Interactive Mode)\n", models.Version)
 	fmt.Printf("Model: %s\n", options.Model)
 	fmt.Println("Exit: Ctrl+C")
@@ -89,10 +110,9 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 			continue
 		}
 
-		cfg := models.LookupModel(options.Model)
 		tone := cfg.Tone
 		if options.Reasoning {
-			tone = "Reasoning"
+			tone = models.ModelRegistry["reasoning"].Tone
 		}
 
 		if options.NoStream {
@@ -120,14 +140,16 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 		return fmt.Errorf("prompt is required for single query mode")
 	}
 
-	cfg := models.LookupModel(options.Model)
+	cfg, err := resolveCLIModel(options.Model)
+	if err != nil {
+		return err
+	}
 	tone := cfg.Tone
 	if options.Reasoning {
-		tone = "Reasoning"
+		tone = models.ModelRegistry["reasoning"].Tone
 	}
 
 	var result string
-	var err error
 
 	if options.NoStream {
 		result, err = cli.m365Client.Chat(options.Prompt, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)

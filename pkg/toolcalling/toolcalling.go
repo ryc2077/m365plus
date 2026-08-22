@@ -14,7 +14,28 @@ package toolcalling
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
 )
+
+const WebSearchToolName = "web_search"
+
+func IsWebSearchTool(tool *ToolDef) bool {
+	return strings.EqualFold(tool.Type, WebSearchToolName) ||
+		strings.EqualFold(ToolName(tool), WebSearchToolName)
+}
+
+func RouteableTools(tools []ToolDef) []ToolDef {
+	out := make([]ToolDef, 0, len(tools))
+	for index := range tools {
+		if IsWebSearchTool(&tools[index]) {
+			continue
+		}
+		out = append(out, tools[index])
+	}
+	return out
+}
 
 // ToolDef represents a tool definition from the client request.
 type ToolDef struct {
@@ -77,13 +98,9 @@ type ToolCall struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-// toolCallIDCounter generates sequential tool call IDs.
-var toolCallIDCounter int
-
 // nextToolCallID returns a unique tool call ID.
 func nextToolCallID() string {
-	toolCallIDCounter++
-	return fmt.Sprintf("call_%d", toolCallIDCounter)
+	return "call_" + uuid.NewString()
 }
 
 // ToolName extracts the name from either OpenAI or Anthropic tool definition.
