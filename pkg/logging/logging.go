@@ -27,9 +27,17 @@ const (
 )
 
 const (
-	// defaultLogFile is the path to the log file inside the data directory.
-	defaultLogFile = "data/proxy.log"
+	defaultDataDir = "data"
+	logFileName    = "proxy.log"
 )
+
+func logFilePath() string {
+	dataDir := os.Getenv("M365_DATA_DIR")
+	if dataDir == "" {
+		dataDir = defaultDataDir
+	}
+	return filepath.Join(dataDir, logFileName)
+}
 
 var (
 	mu       sync.Mutex
@@ -40,26 +48,26 @@ var (
 	logger   *log.Logger
 )
 
-// Init initializes the dual-writer logger. It creates the log file at
-// data/proxy.log (appends if it exists) and also writes to stdout. Call this
-// once at program start, before any logging calls.
+// Init initializes the dual-writer logger. It creates proxy.log under
+// M365_DATA_DIR, falling back to data/proxy.log, and also writes to stdout.
+// Call this once at program start, before any logging calls.
 func Init(lvl LogLevel) error {
 	mu.Lock()
 	defer mu.Unlock()
 
 	level = lvl
 
-	// Ensure data directory exists
-	dir := filepath.Dir(defaultLogFile)
+	path := logFilePath()
+	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create log directory: %w", err)
 		}
 	}
 
-	f, err := os.OpenFile(defaultLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open log file %s: %w", defaultLogFile, err)
+		return fmt.Errorf("failed to open log file %s: %w", path, err)
 	}
 	fileW = f
 	stdW = os.Stdout
