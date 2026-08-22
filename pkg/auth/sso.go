@@ -330,6 +330,16 @@ func LoadSSOCookiesFor(accountID string) (*SSOCookieStore, error) {
 	return loadSSOCookieStoreFor(accountID)
 }
 
+// LoadM365CookiesFor returns decrypted M365 browser cookies for backup and
+// migration. Missing or unreadable stores return ErrM365CookiesUnavailable.
+func LoadM365CookiesFor(accountID string) ([]SSOCookie, time.Time, error) {
+	store, err := loadM365CookieStoreFor(accountID)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return append([]SSOCookie(nil), store.Cookies...), store.ExtractedAt, nil
+}
+
 // hasSSOCookies checks if SSO cookies are available on disk.
 func hasSSOCookies() bool {
 	return hasSSOCookiesFor("")

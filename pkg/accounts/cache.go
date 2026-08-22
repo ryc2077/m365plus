@@ -163,6 +163,44 @@ func (s *Store) List() []AccountToken {
 	return out
 }
 
+// Import merges complete account records by ID, OID, or email and persists
+// them atomically. Existing accounts not present in the import are preserved.
+func (s *Store) Import(imported []AccountToken) (added, updated int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	original := append([]AccountToken(nil), s.data.Accounts...)
+	for _, incoming := range imported {
+		if incoming.ID == "" {
+			incoming.ID = incoming.OID
+		}
+		if incoming.OID == "" {
+			incoming.OID = incoming.ID
+		}
+		matched := -1
+		for i, existing := range s.data.Accounts {
+			if incoming.ID != "" && (existing.ID == incoming.ID || existing.OID == incoming.ID) ||
+				incoming.OID != "" && (existing.ID == incoming.OID || existing.OID == incoming.OID) ||
+				incoming.Email != "" && existing.Email == incoming.Email {
+				matched = i
+				break
+			}
+		}
+		if matched >= 0 {
+			s.data.Accounts[matched] = incoming
+			updated++
+		} else {
+			s.data.Accounts = append(s.data.Accounts, incoming)
+			added++
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		s.data.Accounts = original
+		return 0, 0, err
+	}
+	return added, updated, nil
+}
+
 func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

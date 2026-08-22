@@ -507,6 +507,15 @@ if (response.output_text) {
       <section id="page-accounts" style="display:none">
         <div class="page-head">
           <div><h2 class="page-title">Account management</h2><p class="page-sub">Authorize and manage Microsoft accounts</p></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" onclick="exportAccounts()"><i data-lucide="download" style="width:14px;height:14px"></i> Export accounts</button>
+            <button class="btn primary" onclick="$('accountBackupFile').click()"><i data-lucide="upload" style="width:14px;height:14px"></i> Import accounts</button>
+            <input id="accountBackupFile" type="file" accept="application/json,.json" style="display:none" onchange="importAccounts(this)">
+          </div>
+        </div>
+        <div class="highlight-box warning" style="margin-top:0;margin-bottom:16px">
+          <div class="highlight-box-title"><i data-lucide="shield-alert" style="width:14px;height:14px"></i> Sensitive backup</div>
+          <p>The exported JSON contains access tokens, refresh tokens, and saved SSO cookies. Store it securely and delete it after migration.</p>
         </div>
         <div class="card" style="margin-bottom:16px">
           <div class="card-head"><span class="card-title">Add account</span></div>
@@ -1207,6 +1216,36 @@ async function loadAccounts(){
     renderAccounts();
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
   loadSSOStatus();
+}
+
+async function exportAccounts(){
+  try{
+    const response=await fetch('/api/accounts/backup/export');
+    if(!response.ok){const text=await response.text();let data;try{data=JSON.parse(text)}catch{}throw Error(data?.error?.message||text||'Export failed');}
+    const blob=await response.blob();
+    const disposition=response.headers.get('Content-Disposition')||'';
+    const match=disposition.match(/filename="?([^";]+)"?/i);
+    const link=document.createElement('a');
+    link.href=URL.createObjectURL(blob);
+    link.download=match?.[1]||'m365plus-accounts.json';
+    document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(link.href);
+    showNotice('Account backup exported','success');
+  }catch(e){showNotice(e.message,'error');}
+}
+
+async function importAccounts(input){
+  const file=input.files?.[0];
+  input.value='';
+  if(!file)return;
+  if(file.size>16*1024*1024)return showNotice('Backup file exceeds 16 MB','error');
+  if(!confirm('Import accounts from this backup? Existing matching accounts will be updated.'))return;
+  try{
+    const text=await file.text();
+    JSON.parse(text);
+    const result=await api('/api/accounts/backup/import',{method:'POST',body:text});
+    showNotice(`Imported ${result.added||0} new, updated ${result.updated||0}, restored cookies for ${result.cookieAccounts||0}`,'success');
+    loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
 }
 
 async function loadSSOStatus(){
