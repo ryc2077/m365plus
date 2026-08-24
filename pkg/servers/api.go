@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -613,13 +614,7 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if len(api.config.APIKeys) > 0 {
-			valid := false
-			for _, token := range offeredAPIKeys(r) {
-				if api.isValidAPIKey(token) {
-					valid = true
-					break
-				}
-			}
+			valid := slices.ContainsFunc(offeredAPIKeys(r), api.isValidAPIKey)
 			if !valid {
 				logging.Warnf("Auth: invalid API key from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Invalid API key")
@@ -847,9 +842,7 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 			"tools": true, "supports_tools": true, "function_calling": true,
 			"reasoning": true, "vision": true,
 		}
-		for name, value := range anthropicCapabilities(reasoningRoute, thinking) {
-			capabilities[name] = value
-		}
+		maps.Copy(capabilities, anthropicCapabilities(reasoningRoute, thinking))
 		modelList = append(modelList, map[string]any{
 			"id": id, "slug": id, "object": "model", "type": "model",
 			"created": 1700000000, "created_at": time.Unix(1700000000, 0).UTC().Format(time.RFC3339),

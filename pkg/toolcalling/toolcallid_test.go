@@ -15,9 +15,7 @@ func TestNextToolCallIDIsUniqueUnderConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			local := make([]string, 0, perGoroutine)
 			for range perGoroutine {
 				local = append(local, nextToolCallID())
@@ -32,7 +30,7 @@ func TestNextToolCallIDIsUniqueUnderConcurrency(t *testing.T) {
 				}
 				seen[id] = true
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

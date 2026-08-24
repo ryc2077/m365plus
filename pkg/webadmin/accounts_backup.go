@@ -17,8 +17,8 @@ type accountCookieBackup struct {
 	AccountID string           `json:"accountId"`
 	Login     []auth.SSOCookie `json:"loginCookies,omitempty"`
 	M365      []auth.SSOCookie `json:"m365Cookies,omitempty"`
-	LoginAt   time.Time        `json:"loginCapturedAt,omitempty"`
-	M365At    time.Time        `json:"m365CapturedAt,omitempty"`
+	LoginAt   time.Time        `json:"loginCapturedAt"`
+	M365At    time.Time        `json:"m365CapturedAt"`
 }
 
 type accountBackup struct {
