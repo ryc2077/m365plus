@@ -4784,20 +4784,7 @@ func responsesInputToMessages(input any) []payload.Message {
 		// Handle function_call_output items (tool results)
 		if itemType == "function_call_output" {
 			callID, _ := m["call_id"].(string)
-			output, _ := m["output"].(string)
-			if output == "" && m["output"] != nil {
-				encoded, _ := json.Marshal(m["output"])
-				output = string(encoded)
-			}
-			messages = append(messages, payload.Message{
-				Role: "tool",
-				Content: fmt.Sprintf(
-					"Authoritative tool result (call_id: %s):\n%s",
-					callID,
-					output,
-				),
-				ToolCallID: callID,
-			})
+			messages = append(messages, responsesToolOutputToMessages(callID, m["output"])...)
 			continue
 		}
 
@@ -4914,6 +4901,87 @@ func responsesInputToMessages(input any) []payload.Message {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 	return messages
+}
+
+func responsesToolOutputToMessages(callID string, output any) []payload.Message {
+	text, images := responsesExtractToolOutputParts(output)
+	if text == "" && len(images) == 0 && output != nil {
+		if encoded, err := json.Marshal(output); err == nil {
+			text = string(encoded)
+		}
+	}
+	toolMessage := payload.Message{
+		Role:       "tool",
+		Content:    fmt.Sprintf("Authoritative tool result (call_id: %s):\n%s", callID, text),
+		ToolCallID: callID,
+	}
+	if len(images) == 0 {
+		return []payload.Message{toolMessage}
+	}
+	continuation := payload.Message{
+		Role:    "user",
+		Content: "The client image inspection tool returned the attached image. Analyze the actual image content and continue answering the user's request. Do not rely only on the file name, dimensions, path, or other metadata.",
+		Images:  images,
+	}
+	return []payload.Message{toolMessage, continuation}
+}
+
+func responsesExtractToolOutputParts(output any) (string, []payload.ImageData) {
+	if output == nil {
+		return "", nil
+	}
+	if text, ok := output.(string); ok {
+		var decoded any
+		if json.Unmarshal([]byte(text), &decoded) == nil {
+			if decodedText, images := responsesExtractToolOutputParts(decoded); decodedText != "" || len(images) > 0 {
+				return decodedText, images
+			}
+		}
+		return text, nil
+	}
+
+	var texts []string
+	var images []payload.ImageData
+	var visit func(any)
+	visit = func(value any) {
+		switch current := value.(type) {
+		case []any:
+			for _, item := range current {
+				visit(item)
+			}
+		case map[string]any:
+			partType, _ := current["type"].(string)
+			if partType == "input_text" || partType == "output_text" || partType == "text" {
+				if text, ok := current["text"].(string); ok && strings.TrimSpace(text) != "" {
+					texts = append(texts, text)
+				}
+			}
+			if partType == "input_image" || partType == "image" || partType == "local_image" {
+				if image := imageDataFromToolOutputPart(current); image != nil {
+					images = append(images, *image)
+				}
+			}
+			for _, key := range []string{"content", "output", "result"} {
+				if nested, exists := current[key]; exists {
+					visit(nested)
+				}
+			}
+		}
+	}
+	visit(output)
+	return strings.Join(texts, "\n"), images
+}
+
+func imageDataFromToolOutputPart(part map[string]any) *payload.ImageData {
+	if image := imageDataFromContentPart(part); image != nil {
+		return image
+	}
+	for _, key := range []string{"path", "image_path", "local_path", "url"} {
+		if value, ok := part[key].(string); ok && strings.TrimSpace(value) != "" {
+			return imageDataFromImageURL(value)
+		}
+	}
+	return nil
 }
 
 func responsesInputIsEmpty(messages []payload.Message) bool {

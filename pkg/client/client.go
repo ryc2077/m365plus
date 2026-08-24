@@ -23,6 +23,7 @@ import (
 	"github.com/ryc2077/m365plus/pkg/logging"
 	"github.com/ryc2077/m365plus/pkg/models"
 	"github.com/ryc2077/m365plus/pkg/payload"
+	"github.com/ryc2077/m365plus/pkg/webadmin/outbound"
 )
 
 const (
@@ -158,8 +159,10 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 		req.Header.Set("x-anchormailbox", fmt.Sprintf("Oid:%s@%s", userOID, tenantID))
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(req)
+	httpClient := outbound.HTTPClient()
+	clientCopy := *httpClient
+	clientCopy.Timeout = 30 * time.Second
+	resp, err := clientCopy.Do(req)
 	if err != nil {
 		logging.Errorf("UploadFile: request failed: %v", err)
 		return nil, fmt.Errorf("upload request failed: %w", err)
@@ -215,9 +218,8 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 		return nil, "", "", err
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: c.handshakeTimeout,
-	}
+	dialer := outbound.WebSocketDialer()
+	dialer.HandshakeTimeout = c.handshakeTimeout
 
 	conn, dialResponse, err := dialer.Dial(url, nil)
 	if err != nil {

@@ -750,6 +750,60 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T
 	}
 }
 
+func TestResponsesFunctionCallOutputPreservesStructuredImage(t *testing.T) {
+	messages := responsesInputToMessages([]any{
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_image",
+			"output": []any{
+				map[string]any{"type": "text", "text": "Viewed Image"},
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+			},
+		},
+	})
+
+	if len(messages) != 2 {
+		t.Fatalf("message count = %d, want 2", len(messages))
+	}
+	if messages[0].Role != "tool" || messages[0].ToolCallID != "call_image" {
+		t.Fatalf("unexpected tool message: %#v", messages[0])
+	}
+	if !strings.Contains(messages[0].Content, "Viewed Image") {
+		t.Fatalf("tool text missing: %s", messages[0].Content)
+	}
+	if len(messages[0].Images) != 0 {
+		t.Fatalf("tool history unexpectedly carries images: %#v", messages[0].Images)
+	}
+	if messages[1].Role != "user" || len(messages[1].Images) != 1 || messages[1].Images[0].MediaType != "image/png" {
+		t.Fatalf("image continuation missing: %#v", messages[1])
+	}
+	if !strings.Contains(messages[1].Content, "actual image content") {
+		t.Fatalf("image continuation instruction missing: %s", messages[1].Content)
+	}
+}
+
+func TestResponsesFunctionCallOutputImageOnlyGetsContinuationText(t *testing.T) {
+	messages := responsesInputToMessages([]any{
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_image_only",
+			"output": []any{
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+			},
+		},
+	})
+
+	if len(messages) != 2 || len(messages[1].Images) != 1 {
+		t.Fatalf("image tool output not preserved: %#v", messages)
+	}
+	if messages[0].Role != "tool" || messages[1].Role != "user" {
+		t.Fatalf("unexpected image tool message sequence: %#v", messages)
+	}
+	if !strings.Contains(messages[1].Content, "actual image content") {
+		t.Fatalf("image-only continuation text missing: %s", messages[1].Content)
+	}
+}
+
 func TestResponsesInputPreservesNamespacedToolState(t *testing.T) {
 	namespacedTools := []any{
 		map[string]any{
