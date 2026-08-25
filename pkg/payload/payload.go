@@ -631,6 +631,7 @@ func buildMinimalMessage(hexSID, text string, annotations []MessageAnnotation) m
 
 	if len(annotations) > 0 {
 		msg["messageAnnotations"] = annotations
+		msg["connectedFederatedConnections"] = []string{"dummyId"}
 	}
 
 	return msg

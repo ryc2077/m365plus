@@ -1,10 +1,51 @@
 package payload
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
 )
+
+func TestConversationPayloadUsesUploadedImageAnnotationOnly(t *testing.T) {
+	messages := []Message{{
+		Role:    "user",
+		Content: "Analyze the attached image.",
+		Images:  []ImageData{{Base64: "aW1hZ2U=", MediaType: "image/png", FileName: "upload.png"}},
+		Annotations: []MessageAnnotation{{
+			ID:                    "doc-image",
+			MessageAnnotationType: "ImageFile",
+			MessageAnnotationMetadata: map[string]string{
+				"@type": "File", "annotationType": "File", "fileType": "png", "fileName": "upload.png",
+			},
+		}},
+	}}
+
+	raw, err := BuildConversationPayloadIncremental("0123456789abcdef0123456789abcdef", "session", messages, true, "Balanced", "", true, true, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	arguments := envelope["arguments"].([]any)
+	message := arguments[0].(map[string]any)["message"].(map[string]any)
+	if _, exists := message["imageBase64"]; exists {
+		t.Fatalf("imageBase64 must not be embedded after image upload: %#v", message["imageBase64"])
+	}
+	if _, exists := message["imageUrl"]; exists {
+		t.Fatalf("imageUrl must not be embedded after image upload: %#v", message["imageUrl"])
+	}
+	connections, ok := message["connectedFederatedConnections"].([]any)
+	if !ok || len(connections) != 1 || connections[0] != "dummyId" {
+		t.Fatalf("connectedFederatedConnections = %#v", message["connectedFederatedConnections"])
+	}
+	annotations, ok := message["messageAnnotations"].([]any)
+	if !ok || len(annotations) != 1 {
+		t.Fatalf("messageAnnotations = %#v", message["messageAnnotations"])
+	}
+}
 
 func TestBuildURLUsesEduStarterRoute(t *testing.T) {
 	raw, _, _, err := BuildURL(
