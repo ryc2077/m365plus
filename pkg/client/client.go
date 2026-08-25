@@ -5,6 +5,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,7 @@ type M365Client struct {
 	handshakeTimeout time.Duration
 	recvTimeout      time.Duration
 	recvFinalTimeout time.Duration
+	connectionPool   *websocketPool
 }
 
 // NewM365Client creates a new M365 client instance.
@@ -79,6 +81,7 @@ func NewM365Client(tokenManager *auth.TokenManager) *M365Client {
 		handshakeTimeout: defaultHandshakeTimeout,
 		recvTimeout:      defaultRecvTimeout,
 		recvFinalTimeout: defaultRecvFinalTimeout,
+		connectionPool:   newWebSocketPool(),
 	}
 }
 
@@ -111,8 +114,38 @@ func (c *M365Client) resolveToken() (string, error) {
 	return c.tokenManager.Get()
 }
 
-// Close is a no-op now; per-request connections are closed by dialConnection callers.
 func (c *M365Client) Close() error {
+	c.connectionPool.close()
+	return nil
+}
+
+// Prewarm establishes up to count idle SignalR connections for one account.
+// Connections remain isolated by token, OID, TID, and outbound proxy generation.
+func (c *M365Client) Prewarm(ctx context.Context, accessToken, userOID, tenantID string, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	if count > maxConnectionsPerPoolKey {
+		count = maxConnectionsPerPoolKey
+	}
+	bound := c.WithAccessToken(accessToken)
+	tokenDigest := sha256.Sum256([]byte(accessToken))
+	poolKey := fmt.Sprintf("%x|%s|%s|%d", tokenDigest[:8], userOID, tenantID, outbound.Generation())
+	for bound.connectionPool.count(poolKey) < count {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conversationID := uuid.NewString()
+		connection, _, _, actualKey, err := bound.dialNewConnection(conversationID, userOID, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			bound.connectionPool.discard(connection)
+			return err
+		}
+		bound.connectionPool.put(actualKey, connection)
+	}
 	return nil
 }
 
@@ -202,20 +235,44 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 
 // dialConnection opens a new WebSocket connection for a single request.
 // The caller is responsible for closing the connection when done.
-func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, error) {
+func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, string, error) {
 	logging.Debugf("dialConnection: convID=%s", conversationID)
 	token, err := c.resolveToken()
 	if err != nil {
 		logging.Errorf("dialConnection: failed to get token: %v", err)
-		return nil, "", "", fmt.Errorf("failed to get token: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to get token: %w", err)
 	}
 
 	hexSID := strings.ReplaceAll(uuid.New().String(), "-", "")
 	uuidSID := formatUUID(hexSID)
 
+	tokenDigest := sha256.Sum256([]byte(token))
+	poolKey := fmt.Sprintf("%x|%s|%s|%d", tokenDigest[:8], userOID, tenantID, outbound.Generation())
+	if connection := c.connectionPool.take(poolKey); connection != nil {
+		return connection, hexSID, uuidSID, poolKey, nil
+	}
+	return c.dialNewConnectionWithToken(token, conversationID, userOID, tenantID, hexSID, uuidSID, poolKey)
+}
+
+// dialNewConnection always creates and handshakes a fresh connection. It is
+// used by prewarming so an existing idle connection is not repeatedly taken
+// from and returned to the pool while trying to reach the target pool size.
+func (c *M365Client) dialNewConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, string, error) {
+	token, err := c.resolveToken()
+	if err != nil {
+		return nil, "", "", "", fmt.Errorf("failed to get token: %w", err)
+	}
+	hexSID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	uuidSID := formatUUID(hexSID)
+	tokenDigest := sha256.Sum256([]byte(token))
+	poolKey := fmt.Sprintf("%x|%s|%s|%d", tokenDigest[:8], userOID, tenantID, outbound.Generation())
+	return c.dialNewConnectionWithToken(token, conversationID, userOID, tenantID, hexSID, uuidSID, poolKey)
+}
+
+func (c *M365Client) dialNewConnectionWithToken(token, conversationID, userOID, tenantID, hexSID, uuidSID, poolKey string) (*websocket.Conn, string, string, string, error) {
 	url, _, _, err := payload.BuildURL(token, hexSID, conversationID, userOID, tenantID)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", "", err
 	}
 
 	dialer := outbound.WebSocketDialer()
@@ -229,13 +286,13 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 			_ = dialResponse.Body.Close()
 		}
 		logging.Errorf("dialConnection: WebSocket dial failed: status=%d err=%v", status, err)
-		return nil, "", "", &UpstreamError{Op: "dial", Status: status, Err: err}
+		return nil, "", "", "", &UpstreamError{Op: "dial", Status: status, Err: err}
 	}
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(handshakeMessage)); err != nil {
 		conn.Close()
 		logging.Errorf("dialConnection: handshake write failed: %v", err)
-		return nil, "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
+		return nil, "", "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
 	}
 
 	conn.SetReadDeadline(time.Now().Add(c.handshakeTimeout))
@@ -243,30 +300,39 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 	if err != nil {
 		conn.Close()
 		logging.Errorf("dialConnection: handshake read failed: %v", err)
-		return nil, "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
+		return nil, "", "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
 	}
 	conn.SetReadDeadline(time.Time{})
 
 	logging.Debug("dialConnection: WebSocket connected and handshake OK")
-	return conn, hexSID, uuidSID, nil
+	return conn, hexSID, uuidSID, poolKey, nil
 }
 
 // Chat sends a single message and returns the complete response.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
 	logging.Infof("Chat: tone=%s override=%s convID=%s hasTools=%v", tone, gptOverride, conversationID, hasTools)
-	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+	conn, hexSID, uuidSID, poolKey, err := c.dialConnection(conversationID, userOID, tenantID)
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	reusable := false
+	defer func() {
+		if reusable {
+			c.connectionPool.put(poolKey, conn)
+		} else {
+			c.connectionPool.discard(conn)
+		}
+	}()
 
 	payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, hasTools, nil)
 	if err != nil {
 		return "", err
 	}
 
-	return c.sendRecv(conn, payloadStr)
+	result, err := c.sendRecv(conn, payloadStr)
+	reusable = err == nil
+	return result, err
 }
 
 // ChatStream sends a message and streams the response to stdout.
@@ -471,7 +537,7 @@ func (c *M365Client) ChatConversationStreamGenContext(
 			}
 		}
 
-		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+		conn, hexSID, uuidSID, poolKey, err := c.dialConnection(conversationID, userOID, tenantID)
 		if err != nil {
 			logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
 			if ctx.Err() == nil {
@@ -479,7 +545,14 @@ func (c *M365Client) ChatConversationStreamGenContext(
 			}
 			return
 		}
-		defer conn.Close()
+		reusable := false
+		defer func() {
+			if reusable {
+				c.connectionPool.put(poolKey, conn)
+			} else {
+				c.connectionPool.discard(conn)
+			}
+		}()
 		contextWatchDone := make(chan struct{})
 		defer close(contextWatchDone)
 		go func() {
@@ -531,6 +604,7 @@ func (c *M365Client) ChatConversationStreamGenContext(
 		var finalConvID string
 		var throttling *ThrottlingInfo
 
+		var frameDecoder signalRFrameDecoder
 		for {
 			conn.SetReadDeadline(time.Now().Add(c.recvFinalTimeout))
 			msgType, message, err := conn.ReadMessage()
@@ -553,19 +627,12 @@ func (c *M365Client) ChatConversationStreamGenContext(
 				continue
 			}
 
-			text := string(message)
-			parts := strings.SplitSeq(text, signalRDelimiter)
-
-			for part := range parts {
-				part = strings.TrimSpace(part)
-				if part == "" {
-					continue
-				}
-
-				var data map[string]any
-				if err := json.Unmarshal([]byte(part), &data); err != nil {
-					continue
-				}
+			frames, err := frameDecoder.Feed(message)
+			if err != nil {
+				emit(StreamChunk{Error: err})
+				return
+			}
+			for _, data := range frames {
 
 				// DEBUG: log every WebSocket message type and target (ConvStream)
 				if mt, ok := data["type"].(float64); ok {
@@ -696,6 +763,7 @@ func (c *M365Client) ChatConversationStreamGenContext(
 						}
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
+					reusable = true
 					if held := citations.flush(); held != "" {
 						logging.Warnf("ChatConversationStreamGen: dropped %d bytes of an unterminated citation marker", len(held))
 					}
@@ -756,6 +824,7 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 
 	fullText := ""
 
+	var frameDecoder signalRFrameDecoder
 	for {
 		conn.SetReadDeadline(time.Now().Add(c.recvTimeout))
 		msgType, message, err := conn.ReadMessage()
@@ -769,19 +838,11 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 			continue
 		}
 
-		text := string(message)
-		parts := strings.SplitSeq(text, signalRDelimiter)
-
-		for part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-
-			var data map[string]any
-			if err := json.Unmarshal([]byte(part), &data); err != nil {
-				continue
-			}
+		frames, err := frameDecoder.Feed(message)
+		if err != nil {
+			return "", err
+		}
+		for _, data := range frames {
 
 			if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 				if target, ok := data["target"].(string); ok && target == "update" {

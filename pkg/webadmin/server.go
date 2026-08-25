@@ -1,6 +1,7 @@
 package webadmin
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ryc2077/m365plus/pkg/accounts"
+	"github.com/ryc2077/m365plus/pkg/client"
 	"github.com/ryc2077/m365plus/pkg/logging"
 	"github.com/ryc2077/m365plus/pkg/servers"
 )
@@ -133,6 +135,36 @@ func (s *Server) ResolveAccountForKey(rawKey string) (accounts.AccountToken, boo
 	}
 	return acc, true, nil
 }
+
+// PrewarmAccounts prepares isolated SignalR connections for every usable
+// account. Failures are logged and never prevent the service from starting.
+func (s *Server) PrewarmAccounts(ctx context.Context, m365Client *client.M365Client) {
+	if m365Client == nil {
+		return
+	}
+	for _, listed := range s.tokens.List() {
+		account, err := s.tokens.EnsureValid(listed.ID)
+		if err != nil {
+			logging.Warnf("skip WebSocket prewarm for account %s: %v", listed.ID, err)
+			continue
+		}
+		if account.AccessToken == "" {
+			continue
+		}
+		oid, tid := account.OID, account.TID
+		if oid == "" || tid == "" {
+			oid, tid = extractOIDTID(account.AccessToken)
+		}
+		warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err = m365Client.Prewarm(warmCtx, account.AccessToken, oid, tid, maxConnectionsPerAccount())
+		cancel()
+		if err != nil {
+			logging.Warnf("WebSocket prewarm failed for account %s: %v", account.ID, err)
+		}
+	}
+}
+
+func maxConnectionsPerAccount() int { return 2 }
 
 // IncrementalContextEnabled reports whether session-context continuation is
 // allowed. Rotation and incremental context are mutually exclusive: the data
@@ -256,6 +288,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
 	m.HandleFunc("/api/health", s.health)
 	m.HandleFunc("/api/version", s.version)
+	m.HandleFunc("/api/update", s.update)
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)

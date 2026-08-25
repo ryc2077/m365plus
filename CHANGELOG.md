@@ -5,6 +5,23 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-08-25
+
+### Added
+- Add an About page with runtime version information and a GitHub update checker
+- Add account-isolated WebSocket connection pooling and startup prewarming
+- Add release checksums covering standard binaries and LXC packages
+
+### Changed
+- Reuse healthy SignalR connections to reduce stable-state time to first byte
+- Isolate pooled connections by access token, account OID, tenant TID, and outbound proxy generation
+
+### Fixed
+- Preserve SignalR JSON records split across multiple WebSocket messages
+- Propagate image upload failures before starting Responses API streaming
+- Discard failed, timed-out, or cancelled WebSocket connections instead of returning them to the pool
+- Prevent stale connections from being reused after an outbound proxy change
+
 ## [1.3.12] - 2026-08-15
 
 ### Added

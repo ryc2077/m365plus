@@ -570,8 +570,13 @@ func (api *APIServer) StartBackgroundTasks() {
 	if api.stopCh == nil {
 		api.stopCh = make(chan struct{})
 	}
+	resolver := api.accountResolver
+	m365Client := api.m365Client
 	api.mu.Unlock()
 	go api.runTokenRefresher()
+	if source, ok := resolver.(AccountPrewarmSource); ok && m365Client != nil {
+		go source.PrewarmAccounts(context.Background(), m365Client)
+	}
 }
 
 // runTokenRefresher periodically refreshes the access token in the background.
@@ -728,6 +733,9 @@ func (api *APIServer) Stop() error {
 	if api.stopCh != nil {
 		close(api.stopCh)
 		api.stopCh = nil
+	}
+	if api.m365Client != nil {
+		_ = api.m365Client.Close()
 	}
 
 	if api.server != nil {
@@ -1528,7 +1536,10 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(r, &req.Messages, convID)
+	if err := api.uploadImagesAndAnnotate(r, &req.Messages, convID); err != nil {
+		api.sendUpstreamError(w, "image upload", err)
+		return
+	}
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -1780,7 +1791,10 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(r, &chatMessages, convID)
+	if err := api.uploadImagesAndAnnotate(r, &chatMessages, convID); err != nil {
+		api.sendUpstreamError(w, "image upload", err)
+		return
+	}
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -3398,7 +3412,7 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 // uploadImagesAndAnnotate uploads any images found in message Images fields
 // to the M365 backend and attaches the resulting docId annotations to the
 // last message with images. This enables multimodal image input support.
-func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]payload.Message, convID string) {
+func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]payload.Message, convID string) error {
 	for i := range *messages {
 		resolveRemoteImages(&(*messages)[i])
 	}
@@ -3414,7 +3428,7 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 		}
 	}
 	if lastImgIdx < 0 {
-		return
+		return nil
 	}
 
 	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
@@ -3429,12 +3443,13 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 	for _, img := range msg.Images {
 		result, err := m365.UploadFile(img.Base64, img.MediaType, img.FileName, uploadConvID, oid, tid)
 		if err != nil {
-			logging.Errorf("Image upload failed: %v", err)
-			continue
+			return fmt.Errorf("upload image %q: %w", img.FileName, err)
 		}
 		if !result.IsSuccess {
-			logging.Warnf("Image upload returned non-success: %+v", result)
-			continue
+			return fmt.Errorf("upload image %q: M365 returned a non-success result", img.FileName)
+		}
+		if strings.TrimSpace(result.DocID) == "" {
+			return fmt.Errorf("upload image %q: M365 returned an empty document id", img.FileName)
 		}
 
 		fileType := strings.TrimPrefix(result.FileType, ".")
@@ -3449,6 +3464,7 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 			},
 		})
 	}
+	return nil
 }
 
 // injectJSONMode injects JSON mode instructions into messages.
@@ -4677,7 +4693,10 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Upload any images found in multimodal content
-	api.uploadImagesAndAnnotate(r, &messages, convID)
+	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
+		api.sendUpstreamError(w, "image upload", err)
+		return
+	}
 	goalOpen := responsesGoalContinuationOpen(req.Input)
 
 	if len(localTools) > 0 {
@@ -6381,7 +6400,10 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	)
 
 	// Upload any images found in multimodal content
-	api.uploadImagesAndAnnotate(r, &messages, convID)
+	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
+		api.sendUpstreamError(w, "image upload", err)
+		return
+	}
 
 	hasTools := len(req.Tools) > 0
 
@@ -6854,7 +6876,10 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	messages := []payload.Message{msg}
 
 	// Upload images and attach annotations
-	api.uploadImagesAndAnnotate(r, &messages, convID)
+	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
+		api.sendUpstreamError(w, "image upload", err)
+		return
+	}
 
 	respText, _, _, _, finalConvID, err := m365.ChatConversation(messages, cfg.Tone, cfg.Override, convID, oid, tid, false)
 	if err != nil {

@@ -30,6 +30,12 @@ type AccountResolver interface {
 	IncrementalContextEnabled() bool
 }
 
+// AccountPrewarmSource optionally exposes accounts that should have SignalR
+// connections established during service startup.
+type AccountPrewarmSource interface {
+	PrewarmAccounts(context.Context, *client.M365Client)
+}
+
 // reqAccount carries the per-request account binding through the call chain.
 // A nil reqAccount means single-account mode (config + tokenManager).
 type reqAccount struct {

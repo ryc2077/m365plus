@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,10 +26,18 @@ type Clients struct {
 }
 
 var (
-	clientsMu sync.RWMutex
-	clients   = directClients()
-	proxyPool *Pool
+	clientsMu       sync.RWMutex
+	clients         = directClients()
+	proxyPool       *Pool
+	proxyGeneration atomic.Uint64
 )
+
+func init() { proxyGeneration.Store(1) }
+
+// Generation changes whenever the configured outbound route changes.
+// WebSocket pools include it in their isolation key so connections opened
+// through an old proxy are never reused after a route switch.
+func Generation() uint64 { return proxyGeneration.Load() }
 
 func directClients() *Clients {
 	t := http.DefaultTransport.(*http.Transport).Clone()
@@ -50,6 +59,7 @@ func Configure(raw string) error {
 	clientsMu.Lock()
 	clients = c
 	proxyPool = nil
+	proxyGeneration.Add(1)
 	clientsMu.Unlock()
 	return nil
 }
@@ -60,6 +70,7 @@ func ConfigurePool(raw []string) error {
 	}
 	clientsMu.Lock()
 	proxyPool = p
+	proxyGeneration.Add(1)
 	clientsMu.Unlock()
 	return nil
 }
