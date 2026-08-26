@@ -9,7 +9,7 @@ import (
 
 const (
 	maxConnectionsPerPoolKey = 2
-	pooledConnectionMaxIdle  = 90 * time.Second
+	pooledConnectionMaxIdle  = 25 * time.Second
 )
 
 type pooledWebSocket struct {

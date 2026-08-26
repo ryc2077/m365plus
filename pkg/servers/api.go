@@ -1186,6 +1186,66 @@ func replaceRequestTools(body []byte, tools []toolcalling.ToolDef) string {
 	return string(updated)
 }
 
+func replaceResponsesRequestTools(body []byte, tools []toolcalling.ToolDef) string {
+	requestJSON := replaceRequestTools(body, tools)
+	var request any
+	if json.Unmarshal([]byte(requestJSON), &request) != nil {
+		return redactResponsesImageData(requestJSON)
+	}
+	redactResponsesImageValues(request)
+	updated, err := json.Marshal(request)
+	if err != nil {
+		return redactResponsesImageData(requestJSON)
+	}
+	return string(updated)
+}
+
+func redactResponsesImageValues(value any) {
+	switch current := value.(type) {
+	case []any:
+		for index := range current {
+			if text, ok := current[index].(string); ok {
+				current[index] = redactResponsesImageData(text)
+				continue
+			}
+			redactResponsesImageValues(current[index])
+		}
+	case map[string]any:
+		for key, item := range current {
+			if text, ok := item.(string); ok {
+				current[key] = redactResponsesImageData(text)
+				continue
+			}
+			redactResponsesImageValues(item)
+		}
+	}
+}
+
+func redactResponsesImageData(value string) string {
+	const marker = "[image binary omitted; image is attached separately]"
+	for {
+		start := strings.Index(value, "data:image/")
+		if start < 0 {
+			return value
+		}
+		comma := strings.IndexByte(value[start:], ',')
+		if comma < 0 {
+			return value
+		}
+		comma += start
+		end := comma + 1
+		for end < len(value) {
+			character := value[end]
+			if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '+' || character == '/' || character == '=' || character == '-' || character == '_' {
+				end++
+				continue
+			}
+			break
+		}
+		value = value[:start] + marker + value[end:]
+	}
+}
+
 func activeToolMessages(messages []payload.Message) []payload.Message {
 	start := 0
 	for i := range messages {
@@ -1499,7 +1559,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
 	req.Tools = preparedTools
-	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
+	requestJSON := replaceResponsesRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
 		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice), buildToolLedger(req.Messages).EvidenceNote())
 	}
@@ -1536,7 +1596,8 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	if err := api.uploadImagesAndAnnotate(r, &req.Messages, convID); err != nil {
+	convID, err = api.uploadImagesAndAnnotate(r, &req.Messages, convID)
+	if err != nil {
 		api.sendUpstreamError(w, "image upload", err)
 		return
 	}
@@ -1791,7 +1852,8 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	if err := api.uploadImagesAndAnnotate(r, &chatMessages, convID); err != nil {
+	convID, err = api.uploadImagesAndAnnotate(r, &chatMessages, convID)
+	if err != nil {
 		api.sendUpstreamError(w, "image upload", err)
 		return
 	}
@@ -2448,8 +2510,7 @@ func (api *APIServer) nonStreamChatCompletions(r *http.Request, w http.ResponseW
 		}
 	}
 
-	promptStr := fmt.Sprint(messages)
-	promptTok := countTokens(promptStr)
+	promptTok := countPromptTokens(messages, tools, "")
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
 	response := map[string]any{
@@ -3229,8 +3290,7 @@ func (api *APIServer) nonStreamCompletions(r *http.Request, w http.ResponseWrite
 		}
 	}
 
-	promptStr := fmt.Sprint(messages)
-	promptTok := countTokens(promptStr)
+	promptTok := countPromptTokens(messages, tools, "")
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
 
@@ -3412,7 +3472,7 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 // uploadImagesAndAnnotate uploads any images found in message Images fields
 // to the M365 backend and attaches the resulting docId annotations to the
 // last message with images. This enables multimodal image input support.
-func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]payload.Message, convID string) error {
+func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]payload.Message, convID string) (string, error) {
 	for i := range *messages {
 		resolveRemoteImages(&(*messages)[i])
 	}
@@ -3428,7 +3488,7 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 		}
 	}
 	if lastImgIdx < 0 {
-		return nil
+		return convID, nil
 	}
 
 	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
@@ -3443,13 +3503,13 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 	for _, img := range msg.Images {
 		result, err := m365.UploadFile(img.Base64, img.MediaType, img.FileName, uploadConvID, oid, tid)
 		if err != nil {
-			return fmt.Errorf("upload image %q: %w", img.FileName, err)
+			return "", fmt.Errorf("upload image %q: %w", img.FileName, err)
 		}
 		if !result.IsSuccess {
-			return fmt.Errorf("upload image %q: M365 returned a non-success result", img.FileName)
+			return "", fmt.Errorf("upload image %q: M365 returned a non-success result", img.FileName)
 		}
 		if strings.TrimSpace(result.DocID) == "" {
-			return fmt.Errorf("upload image %q: M365 returned an empty document id", img.FileName)
+			return "", fmt.Errorf("upload image %q: M365 returned an empty document id", img.FileName)
 		}
 
 		fileType := strings.TrimPrefix(result.FileType, ".")
@@ -3464,7 +3524,7 @@ func (api *APIServer) uploadImagesAndAnnotate(r *http.Request, messages *[]paylo
 			},
 		})
 	}
-	return nil
+	return uploadConvID, nil
 }
 
 // injectJSONMode injects JSON mode instructions into messages.
@@ -4693,7 +4753,8 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Upload any images found in multimodal content
-	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
+	convID, err = api.uploadImagesAndAnnotate(r, &messages, convID)
+	if err != nil {
 		api.sendUpstreamError(w, "image upload", err)
 		return
 	}
@@ -4796,7 +4857,17 @@ func responsesInputToMessages(input any) []payload.Message {
 		// Handle function_call_output items (tool results)
 		if itemType == "function_call_output" {
 			callID, _ := m["call_id"].(string)
-			messages = append(messages, responsesToolOutputToMessages(callID, m["output"])...)
+			output, _ := m["output"].(string)
+			if output == "" && m["output"] != nil {
+				encoded, _ := json.Marshal(m["output"])
+				output = string(encoded)
+			}
+			messages = append(messages, payload.Message{
+				Role:        "tool",
+				Content:     fmt.Sprintf("Authoritative tool result (call_id: %s):\n%s", callID, output),
+				ToolCallID:  callID,
+				ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
+			})
 			continue
 		}
 
@@ -4913,87 +4984,6 @@ func responsesInputToMessages(input any) []payload.Message {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 	return messages
-}
-
-func responsesToolOutputToMessages(callID string, output any) []payload.Message {
-	text, images := responsesExtractToolOutputParts(output)
-	if text == "" && len(images) == 0 && output != nil {
-		if encoded, err := json.Marshal(output); err == nil {
-			text = string(encoded)
-		}
-	}
-	toolMessage := payload.Message{
-		Role:       "tool",
-		Content:    fmt.Sprintf("Authoritative tool result (call_id: %s):\n%s", callID, text),
-		ToolCallID: callID,
-	}
-	if len(images) == 0 {
-		return []payload.Message{toolMessage}
-	}
-	continuation := payload.Message{
-		Role:    "user",
-		Content: "The client image inspection tool returned the attached image. Analyze the actual image content and continue answering the user's request. Do not rely only on the file name, dimensions, path, or other metadata.",
-		Images:  images,
-	}
-	return []payload.Message{toolMessage, continuation}
-}
-
-func responsesExtractToolOutputParts(output any) (string, []payload.ImageData) {
-	if output == nil {
-		return "", nil
-	}
-	if text, ok := output.(string); ok {
-		var decoded any
-		if json.Unmarshal([]byte(text), &decoded) == nil {
-			if decodedText, images := responsesExtractToolOutputParts(decoded); decodedText != "" || len(images) > 0 {
-				return decodedText, images
-			}
-		}
-		return text, nil
-	}
-
-	var texts []string
-	var images []payload.ImageData
-	var visit func(any)
-	visit = func(value any) {
-		switch current := value.(type) {
-		case []any:
-			for _, item := range current {
-				visit(item)
-			}
-		case map[string]any:
-			partType, _ := current["type"].(string)
-			if partType == "input_text" || partType == "output_text" || partType == "text" {
-				if text, ok := current["text"].(string); ok && strings.TrimSpace(text) != "" {
-					texts = append(texts, text)
-				}
-			}
-			if partType == "input_image" || partType == "image" || partType == "local_image" {
-				if image := imageDataFromToolOutputPart(current); image != nil {
-					images = append(images, *image)
-				}
-			}
-			for _, key := range []string{"content", "output", "result"} {
-				if nested, exists := current[key]; exists {
-					visit(nested)
-				}
-			}
-		}
-	}
-	visit(output)
-	return strings.Join(texts, "\n"), images
-}
-
-func imageDataFromToolOutputPart(part map[string]any) *payload.ImageData {
-	if image := imageDataFromContentPart(part); image != nil {
-		return image
-	}
-	for _, key := range []string{"path", "image_path", "local_path", "url"} {
-		if value, ok := part[key].(string); ok && strings.TrimSpace(value) != "" {
-			return imageDataFromImageURL(value)
-		}
-	}
-	return nil
 }
 
 func responsesInputIsEmpty(messages []payload.Message) bool {
@@ -5335,6 +5325,9 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 		api.ctxCache.Set("session:"+sid, result.conversationID)
 	}
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	if result.conversationID != "" {
+		api.ctxCache.Set("session:"+responseID, result.conversationID)
+	}
 	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, toolTypes, goalOpen, result.finishReason, countPromptTokens(messages, tools, toolChoice), countTokens(result.text)+outputProtocolTokens, countTokens(result.thinking))
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
@@ -5568,8 +5561,7 @@ func (api *APIServer) nonStreamResponses(
 		}
 	}
 
-	promptStr := fmt.Sprint(messages)
-	promptTok := countTokens(promptStr)
+	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
 
@@ -6272,14 +6264,17 @@ func (api *APIServer) streamResponses(
 		status = "incomplete"
 	}
 
-	promptStr := fmt.Sprint(messages)
-	promptTok := countTokens(promptStr)
+	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
 	completionTok := countTokens(fullText)
 	reasoningText := thinkingText.String()
 	reasoningTok := countTokens(reasoningText)
 
 	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
+
+	if finalConvID != "" {
+		api.ctxCache.Set("session:"+responseID, finalConvID)
+	}
 
 	sendEvent("response.completed", map[string]any{
 		"response": finalResponse,
@@ -6309,6 +6304,22 @@ const defaultCompactionPrompt = "I need a concise summary of the following conve
 
 func responsesCompactionConversationID(string) string {
 	return ""
+}
+
+func responsesCompactionText(messages []payload.Message) string {
+	var text strings.Builder
+	for _, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if content == "" && len(message.Images) > 0 {
+			content = fmt.Sprintf("[image content omitted during compaction: %d image(s)]", len(message.Images))
+		} else if len(message.Images) > 0 {
+			content += fmt.Sprintf("\n[image binary omitted during compaction: %d image(s)]", len(message.Images))
+		}
+		if content != "" {
+			fmt.Fprintf(&text, "%s: %s\n", message.Role, content)
+		}
+	}
+	return text.String()
 }
 
 // handleResponsesCompact handles POST /v1/responses/compact requests from Codex.
@@ -6361,9 +6372,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	var conversationText strings.Builder
 	conversationText.WriteString(compactionInstr)
 	conversationText.WriteString("\n\n")
-	for _, m := range inputMessages {
-		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
-	}
+	conversationText.WriteString(responsesCompactionText(inputMessages))
 	conversationText.WriteString("\nPlease provide the summary now.")
 
 	messages := []payload.Message{
@@ -6398,12 +6407,6 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	convID := responsesCompactionConversationID(
 		api.ctxCache.Get("session:" + sid),
 	)
-
-	// Upload any images found in multimodal content
-	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
-		api.sendUpstreamError(w, "image upload", err)
-		return
-	}
 
 	hasTools := len(req.Tools) > 0
 
@@ -6876,7 +6879,9 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	messages := []payload.Message{msg}
 
 	// Upload images and attach annotations
-	if err := api.uploadImagesAndAnnotate(r, &messages, convID); err != nil {
+	var err error
+	convID, err = api.uploadImagesAndAnnotate(r, &messages, convID)
+	if err != nil {
 		api.sendUpstreamError(w, "image upload", err)
 		return
 	}

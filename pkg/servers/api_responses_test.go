@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ryc2077/m365plus/pkg/client"
+	"github.com/ryc2077/m365plus/pkg/models"
 	"github.com/ryc2077/m365plus/pkg/payload"
 	"github.com/ryc2077/m365plus/pkg/toolcalling"
 )
@@ -750,7 +751,7 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T
 	}
 }
 
-func TestResponsesFunctionCallOutputPreservesStructuredImage(t *testing.T) {
+func TestResponsesFunctionCallOutputKeepsStructuredImageAsToolData(t *testing.T) {
 	messages := responsesInputToMessages([]any{
 		map[string]any{
 			"type":    "function_call_output",
@@ -762,27 +763,21 @@ func TestResponsesFunctionCallOutputPreservesStructuredImage(t *testing.T) {
 		},
 	})
 
-	if len(messages) != 2 {
-		t.Fatalf("message count = %d, want 2", len(messages))
+	if len(messages) != 1 {
+		t.Fatalf("message count = %d, want 1", len(messages))
 	}
-	if messages[0].Role != "tool" || messages[0].ToolCallID != "call_image" {
-		t.Fatalf("unexpected tool message: %#v", messages[0])
-	}
-	if !strings.Contains(messages[0].Content, "Viewed Image") {
-		t.Fatalf("tool text missing: %s", messages[0].Content)
+	if messages[0].Role != "tool" || messages[0].ToolCallID != "call_image" || len(messages[0].ToolResults) != 1 {
+		t.Fatalf("structured result lost its tool association: %#v", messages)
 	}
 	if len(messages[0].Images) != 0 {
-		t.Fatalf("tool history unexpectedly carries images: %#v", messages[0].Images)
+		t.Fatalf("tool output was incorrectly promoted to a new image input: %#v", messages[0].Images)
 	}
-	if messages[1].Role != "user" || len(messages[1].Images) != 1 || messages[1].Images[0].MediaType != "image/png" {
-		t.Fatalf("image continuation missing: %#v", messages[1])
-	}
-	if !strings.Contains(messages[1].Content, "actual image content") {
-		t.Fatalf("image continuation instruction missing: %s", messages[1].Content)
+	if !strings.Contains(messages[0].Content, "input_image") || !strings.Contains(messages[0].ToolResults[0].Content, "input_image") {
+		t.Fatalf("structured tool output was not preserved as data: %#v", messages[0])
 	}
 }
 
-func TestResponsesFunctionCallOutputImageOnlyGetsContinuationText(t *testing.T) {
+func TestResponsesFunctionCallOutputImageOnlyDoesNotCreateImageTurn(t *testing.T) {
 	messages := responsesInputToMessages([]any{
 		map[string]any{
 			"type":    "function_call_output",
@@ -793,14 +788,68 @@ func TestResponsesFunctionCallOutputImageOnlyGetsContinuationText(t *testing.T) 
 		},
 	})
 
-	if len(messages) != 2 || len(messages[1].Images) != 1 {
-		t.Fatalf("image tool output not preserved: %#v", messages)
+	if len(messages) != 1 {
+		t.Fatalf("message count = %d, want 1", len(messages))
 	}
-	if messages[0].Role != "tool" || messages[1].Role != "user" {
-		t.Fatalf("unexpected image tool message sequence: %#v", messages)
+	if messages[0].Role != "tool" || messages[0].ToolCallID != "call_image_only" || len(messages[0].ToolResults) != 1 {
+		t.Fatalf("image result lost its tool association: %#v", messages)
 	}
-	if !strings.Contains(messages[1].Content, "actual image content") {
-		t.Fatalf("image-only continuation text missing: %s", messages[1].Content)
+	if len(messages[0].Images) != 0 {
+		t.Fatalf("tool output became a synthetic image input: %#v", messages[0].Images)
+	}
+}
+
+func TestResponsesImageToolResultDoesNotCreateSyntheticImageInput(t *testing.T) {
+	messages := responsesInputToMessages([]any{
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_view_image",
+			"output": []any{
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+			},
+		},
+	})
+
+	if len(messages) != 1 {
+		t.Fatalf("image tool result created %d messages, want exactly one: %#v", len(messages), messages)
+	}
+	if messages[0].Role != "tool" || messages[0].ToolCallID != "call_view_image" || len(messages[0].ToolResults) != 1 {
+		t.Fatalf("image tool result was not kept as authoritative tool data: %#v", messages[0])
+	}
+	if len(messages[0].Images) != 0 {
+		t.Fatalf("image tool result was incorrectly attached for upload: %#v", messages[0].Images)
+	}
+}
+
+func TestReplaceResponsesRequestToolsRedactsImageBinaryOnlyFromSimulationCopy(t *testing.T) {
+	const imageData = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+	body := []byte(`{"model":"gpt-test","input":[{"type":"function_call_output","call_id":"call_image","output":[{"type":"input_image","image_url":"` + imageData + `"}]}],"tools":[]}`)
+
+	got := replaceResponsesRequestTools(body, nil)
+	if strings.Contains(got, imageData) {
+		t.Fatalf("simulation request retained image binary: %s", got)
+	}
+	if !strings.Contains(got, "image binary omitted") {
+		t.Fatalf("simulation request lost image placeholder: %s", got)
+	}
+
+	var original map[string]any
+	if err := json.Unmarshal(body, &original); err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(original)
+	if !strings.Contains(string(encoded), imageData) {
+		t.Fatal("original request image was mutated")
+	}
+}
+
+func TestReplaceResponsesRequestToolsRedactsStringifiedToolOutput(t *testing.T) {
+	const imageData = "data:image/jpeg;base64,AAAAABBBBBCCCCCDDDD"
+	body := []byte(`{"model":"gpt-test","input":[{"type":"function_call_output","call_id":"call_image","output":"{\"type\":\"input_image\",\"image_url\":\"` + imageData + `\"}"}],"tools":[]}`)
+
+	got := replaceResponsesRequestTools(body, nil)
+	if strings.Contains(got, imageData) || !strings.Contains(got, "image binary omitted") {
+		t.Fatalf("stringified image output was not redacted: %s", got)
 	}
 }
 
@@ -961,6 +1010,25 @@ func TestShouldResetResponsesSession(t *testing.T) {
 func TestResponsesCompactionAlwaysUsesFreshConversation(t *testing.T) {
 	if got := responsesCompactionConversationID("conv-poisoned"); got != "" {
 		t.Fatalf("compaction reused sticky conversation %q", got)
+	}
+}
+
+func TestResponsesCompactionTextOmitsImageBinary(t *testing.T) {
+	messages := []payload.Message{{
+		Role:    "user",
+		Content: "Viewed Image",
+		Images: []payload.ImageData{{
+			Base64:    strings.Repeat("A", 1024),
+			MediaType: "image/png",
+			FileName:  "test.png",
+		}},
+	}}
+	got := responsesCompactionText(messages)
+	if strings.Contains(got, strings.Repeat("A", 64)) {
+		t.Fatalf("compaction retained image binary: %q", got)
+	}
+	if !strings.Contains(got, "Viewed Image") || !strings.Contains(got, "image binary omitted") {
+		t.Fatalf("compaction lost image metadata: %q", got)
 	}
 }
 
@@ -1636,6 +1704,30 @@ func TestContextCacheSetPreservesSession(t *testing.T) {
 	}
 	if got := cache.Get("session:conv-a"); got != "conv-backend-99" {
 		t.Fatalf("conversation id lost after Set: %q", got)
+	}
+}
+
+func TestBufferedResponsesMapsResponseIDToConversation(t *testing.T) {
+	api := &APIServer{ctxCache: NewContextCache(t.TempDir())}
+	recorder := httptest.NewRecorder()
+	api.respondBufferedResponses(
+		recorder,
+		toolLoopResult{text: "OK", finishReason: "stop", conversationID: "conv-response-map"},
+		[]payload.Message{{Role: "user", Content: "hello"}},
+		models.ModelConfig{OpenAIID: "gpt-5.6-reasoning"},
+		"original-session", 0, false, nil, false, nil, "",
+	)
+
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	responseID, _ := response["id"].(string)
+	if responseID == "" {
+		t.Fatalf("response id missing: %#v", response)
+	}
+	if got := api.ctxCache.Get("session:" + responseID); got != "conv-response-map" {
+		t.Fatalf("response id mapped to %q, want conv-response-map", got)
 	}
 }
 

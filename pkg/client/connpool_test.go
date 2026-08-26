@@ -20,6 +20,12 @@ func TestWebSocketPoolSeparatesKeysAndExpiresIdleEntries(t *testing.T) {
 	}
 }
 
+func TestPooledConnectionIdleWindowStaysBelowUpstreamCloseWindow(t *testing.T) {
+	if pooledConnectionMaxIdle > 30*time.Second {
+		t.Fatalf("pooled connection idle lifetime = %s, want at most 30s", pooledConnectionMaxIdle)
+	}
+}
+
 func TestWebSocketPoolCountRemainsKeyIsolated(t *testing.T) {
 	pool := newWebSocketPool()
 	pool.connections["token-a|oid-a|tid-a|1"] = []pooledWebSocket{{returnedAt: time.Now()}}

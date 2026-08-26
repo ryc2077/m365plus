@@ -68,6 +68,28 @@ func TestToolChoiceFramingNeedsDeclaredTools(t *testing.T) {
 	}
 }
 
+func TestPromptUsageDoesNotCountImageBase64AsText(t *testing.T) {
+	base := []payload.Message{{Role: "user", Content: "Describe this image."}}
+	withImage := []payload.Message{{
+		Role:    "user",
+		Content: "Describe this image.",
+		Images: []payload.ImageData{{
+			Base64:    strings.Repeat("A", 32<<10),
+			MediaType: "image/png",
+			FileName:  "large.png",
+		}},
+	}}
+
+	plain := countPromptTokens(base, nil, "")
+	multimodal := countPromptTokens(withImage, nil, "")
+	if multimodal-plain > 1024 {
+		t.Fatalf("image binary inflated prompt usage from %d to %d tokens", plain, multimodal)
+	}
+	if structCount := countTokens(fmt.Sprint(withImage)); structCount <= multimodal {
+		t.Fatalf("test fixture did not expose Base64 inflation: struct=%d prompt=%d", structCount, multimodal)
+	}
+}
+
 // decodeUsage reads the usage object out of a JSON body under the given key.
 func decodeUsage(t *testing.T, body []byte) map[string]any {
 	t.Helper()
