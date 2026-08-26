@@ -1,5 +1,19 @@
 # Changelog
 
+
+## [2.0.2] - 2026-08-26
+
+### Changed
+- Shorten the idle reuse window for pooled WebSocket connections to avoid upstream-close races
+- Preserve Responses API conversation mappings across buffered and streaming turns
+
+### Fixed
+- Prevent image Base64 payloads from being counted as text tokens in Responses API usage
+- Preserve image tool-call outputs as tool messages without re-uploading duplicate user images
+- Redact image binary data from simulated prompts and compaction text while retaining metadata
+- Propagate the conversation used for image uploads into the following M365 request
+- Avoid immediate context compaction and local image path loss after successful image inspection
+
 All notable changes to M365Bridge will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
