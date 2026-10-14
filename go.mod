@@ -1,6 +1,6 @@
 module github.com/ryc2077/m365plus
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0
@@ -10,5 +10,5 @@ require (
 
 require (
 	github.com/dlclark/regexp2 v1.10.0 // indirect
-	golang.org/x/net v0.35.0
+	golang.org/x/net v0.61.0
 )
